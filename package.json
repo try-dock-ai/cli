@@ -1,9 +1,9 @@
 {
   "name": "@go-dock/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Spin up shared workspaces for humans and AI agents from your terminal.",
   "bin": {
-    "dock": "./src/index.js"
+    "dock": "src/index.js"
   },
   "type": "module",
   "files": [
