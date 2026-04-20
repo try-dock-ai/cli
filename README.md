@@ -1,9 +1,9 @@
-# @go-dock/cli
+# @trydock/cli
 
 Spin up shared workspaces for humans + AI agents from your terminal.
 
 ```bash
-npx @go-dock/cli init
+npx @trydock/cli init
 ```
 
 That's the whole onboarding. Browser opens, you sign in, a workspace is created, you get back a URL + MCP endpoint you can hand to any agent.
@@ -12,10 +12,10 @@ That's the whole onboarding. Browser opens, you sign in, a workspace is created,
 
 ```bash
 # Try it once
-npx @go-dock/cli init
+npx @trydock/cli init
 
 # Install globally
-npm install -g @go-dock/cli
+npm install -g @trydock/cli
 dock init
 ```
 
@@ -131,7 +131,7 @@ dock help                              Show full command list
 **Create a workspace and hand it to Claude:**
 
 ```bash
-$ npx @go-dock/cli init reddit-tracker
+$ npx @trydock/cli init reddit-tracker
 
   Opening your browser to sign in…
   https://trydock.ai/oauth/authorize?client_id=…

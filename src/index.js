@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * @go-dock/cli — spin up shared workspaces for humans + AI agents.
+ * @trydock/cli — spin up shared workspaces for humans + AI agents.
  *
  * Auth uses OAuth 2.1 + PKCE against the Dock server. The first command
  * on a fresh machine (`dock init` or `dock login`) runs the browser

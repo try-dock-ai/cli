@@ -1,6 +1,6 @@
 {
-  "name": "@go-dock/cli",
-  "version": "0.3.0",
+  "name": "@trydock/cli",
+  "version": "0.4.0",
   "description": "Spin up shared workspaces for humans and AI agents from your terminal.",
   "bin": {
     "dock": "src/index.js"
@@ -22,7 +22,7 @@
   },
   "keywords": [
     "dock",
-    "godock",
+    "trydock",
     "ai",
     "agents",
     "workspace",
