@@ -1,6 +1,6 @@
 {
   "name": "@go-dock/cli",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Spin up shared workspaces for humans and AI agents from your terminal.",
   "bin": {
     "dock": "src/index.js"
@@ -14,7 +14,7 @@
   "scripts": {
     "start": "node src/index.js"
   },
-  "homepage": "https://godock.ai",
+  "homepage": "https://trydock.ai",
   "bugs": "https://github.com/go-dock/cli/issues",
   "repository": {
     "type": "git",

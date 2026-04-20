@@ -19,7 +19,7 @@ import { randomBytes, createHash } from "node:crypto";
 
 // ─── Config ────────────────────────────────────────────────────────
 
-const DEFAULT_API = "https://godock.ai";
+const DEFAULT_API = "https://trydock.ai";
 const API_BASE = process.env.DOCK_API_URL || DEFAULT_API;
 const CONFIG_DIR = join(homedir(), ".dock");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
@@ -199,6 +199,57 @@ function ephemeralServer() {
   });
 }
 
+// ─── Output helpers ───────────────────────────────────────────────
+
+// Set by the entry point if `--json` is present anywhere in argv.
+let JSON_MODE = false;
+
+function out(human, jsonValue) {
+  if (JSON_MODE) {
+    process.stdout.write(JSON.stringify(jsonValue ?? human, null, 2) + "\n");
+  } else if (typeof human === "string") {
+    process.stdout.write(human);
+  } else {
+    process.stdout.write(JSON.stringify(human, null, 2) + "\n");
+  }
+}
+
+/** Pull `--key value` and `--flag` out of args. Returns { positional, flags }. */
+function parseFlags(args) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--json") {
+      flags.json = true;
+    } else if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        flags[key] = true;
+      } else {
+        flags[key] = next;
+        i++;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+function confirm(prompt) {
+  // Crude but dependency-free yes/no.
+  process.stdout.write(`  ${prompt} [y/N]: `);
+  return new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.once("data", (chunk) => {
+      process.stdin.pause();
+      resolve(chunk.toString().trim().toLowerCase().startsWith("y"));
+    });
+  });
+}
+
 // ─── Command implementations ──────────────────────────────────────
 
 async function ensureAuth() {
@@ -208,6 +259,35 @@ async function ensureAuth() {
   const next = { ...cfg, ...tok };
   writeConfig(next);
   return next;
+}
+
+/** Lazy-fetch and cache the caller's org slug. Used by every org-scoped
+ *  command (webhooks, billing, support, etc.). */
+let _meCache = null;
+async function getMe() {
+  if (_meCache) return _meCache;
+  await ensureAuth();
+  _meCache = await api("/api/me");
+  return _meCache;
+}
+
+async function getOrgSlug() {
+  const me = await getMe();
+  if (!me?.org?.slug) {
+    throw new Error("Couldn't resolve your org. Try `dock logout` and `dock login` again.");
+  }
+  return me.org.slug;
+}
+
+/** Parse `key=value` args (with `=` allowed in the value) into a record. */
+function parseKv(parts) {
+  const data = {};
+  for (const kv of parts) {
+    const idx = kv.indexOf("=");
+    if (idx <= 0) continue;
+    data[kv.slice(0, idx)] = kv.slice(idx + 1);
+  }
+  return data;
 }
 
 const commands = {
@@ -377,27 +457,497 @@ const commands = {
     console.log(`\n  ✓ Invite sent to ${email} (${role})\n`);
   },
 
+  // ─── Workspaces (additions) ────────────────────────────────────
+
+  async rename(args) {
+    await ensureAuth();
+    const [slug, ...rest] = args;
+    const newName = rest.join(" ").trim();
+    if (!slug || !newName) return usageError("dock rename <workspace> <new-name>");
+    const r = await api(`/api/workspaces/${slug}`, {
+      method: "PATCH",
+      body: { name: newName },
+    });
+    out(`\n  ✓ Renamed → ${r.workspace?.slug || slug}\n`, r);
+  },
+
+  async visibility(args) {
+    await ensureAuth();
+    const [slug, value] = args;
+    if (!slug || !value) {
+      return usageError("dock visibility <workspace> <private|org|unlisted|public>");
+    }
+    const r = await api(`/api/workspaces/${slug}`, {
+      method: "PATCH",
+      body: { visibility: value },
+    });
+    out(`\n  ✓ Visibility set to ${value}\n`, r);
+  },
+
+  async delete(args) {
+    await ensureAuth();
+    const slug = args[0];
+    if (!slug) return usageError("dock delete <workspace>");
+    if (!JSON_MODE) {
+      const ok = await confirm(`Delete workspace "${slug}"? This is irreversible.`);
+      if (!ok) {
+        out("  Cancelled.\n", { cancelled: true });
+        return;
+      }
+    }
+    await api(`/api/workspaces/${slug}`, { method: "DELETE" });
+    out(`\n  ✓ Deleted ${slug}\n`, { deleted: slug });
+  },
+
+  // ─── Rows (additions) ──────────────────────────────────────────
+
+  async get(args) {
+    await ensureAuth();
+    const [slug, id] = args;
+    if (!slug || !id) return usageError("dock get <workspace> <row-id>");
+    const { rows } = await api(`/api/workspaces/${slug}/rows?limit=1000`);
+    const row = rows.find((r) => r.id === id);
+    if (!row) {
+      throw new Error(`Row ${id} not found in ${slug}`);
+    }
+    out(JSON.stringify(row.data, null, 2) + "\n", row);
+  },
+
+  async set(args) {
+    await ensureAuth();
+    const [slug, id, ...kv] = args;
+    if (!slug || !id || kv.length === 0) {
+      return usageError("dock set <workspace> <row-id> key=value [key=value ...]");
+    }
+    const data = parseKv(kv);
+    const r = await api(`/api/workspaces/${slug}/rows/${id}`, {
+      method: "PATCH",
+      body: { data },
+    });
+    out(`\n  ✓ Updated row ${id}\n`, r);
+  },
+
+  async remove(args) {
+    await ensureAuth();
+    const [slug, id] = args;
+    if (!slug || !id) return usageError("dock remove <workspace> <row-id>");
+    await api(`/api/workspaces/${slug}/rows/${id}`, { method: "DELETE" });
+    out(`\n  ✓ Removed row ${id}\n`, { deleted: id });
+  },
+
+  async history(args) {
+    await ensureAuth();
+    const [slug, id] = args;
+    if (!slug || !id) return usageError("dock history <workspace> <row-id>");
+    const { history } = await api(`/api/workspaces/${slug}/rows/${id}/history`);
+    if (JSON_MODE) return out(history);
+    if (!history?.length) {
+      out("\n  (no history)\n");
+      return;
+    }
+    out("\n");
+    for (const h of history) {
+      const when = new Date(h.createdAt).toISOString().slice(0, 19).replace("T", " ");
+      out(`  ${when}  ${h.action}\n`);
+    }
+    out("\n");
+  },
+
+  // ─── Columns ───────────────────────────────────────────────────
+
+  async columns(args) {
+    await ensureAuth();
+    const [slug] = args;
+    if (!slug) return usageError("dock columns <workspace>");
+    const { columns } = await api(`/api/workspaces/${slug}/columns`);
+    if (JSON_MODE) return out(columns);
+    out("\n");
+    for (const c of columns) {
+      out(`  ${c.key.padEnd(20)} ${c.type.padEnd(10)} ${c.label}\n`);
+    }
+    out("\n");
+  },
+
+  // ─── Members ───────────────────────────────────────────────────
+
+  async members(args) {
+    await ensureAuth();
+    const [slug] = args;
+    if (!slug) return usageError("dock members <workspace>");
+    const { members, invites } = await api(`/api/workspaces/${slug}/members`);
+    if (JSON_MODE) return out({ members, invites });
+    out("\n  Members\n");
+    for (const m of members) {
+      const name = m.user?.name || m.user?.email || m.agent?.name || "unknown";
+      out(`    ${m.role.padEnd(10)} ${name}\n`);
+    }
+    if (invites?.length) {
+      out("\n  Pending invites\n");
+      for (const i of invites) out(`    ${i.role.padEnd(10)} ${i.email}\n`);
+    }
+    out("\n");
+  },
+
+  // ─── Doc body ──────────────────────────────────────────────────
+
+  async doc(args) {
+    await ensureAuth();
+    const [slug] = args;
+    if (!slug) return usageError("dock doc <workspace>");
+    const r = await api(`/api/workspaces/${slug}/doc`);
+    if (JSON_MODE) return out(r);
+    out(JSON.stringify(r.content, null, 2) + "\n");
+  },
+
+  // ─── Webhooks (org-scoped) ─────────────────────────────────────
+
+  async webhook(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    // Validate arg shape before hitting the network so a missing flag
+    // doesn't surface as "fetch failed".
+    if (!sub) {
+      return usageError(
+        "dock webhook <list|add|pause|resume|rm|deliveries> [args]"
+      );
+    }
+    if (sub === "add") {
+      const { flags } = parseFlags(rest);
+      if (!flags.url) {
+        return usageError(
+          'dock webhook add --url <https://…> [--events "row.created,row.updated"]'
+        );
+      }
+    }
+    const slug = await getOrgSlug();
+    switch (sub) {
+      case "list": {
+        const { webhooks } = await api(`/api/orgs/${slug}/webhooks`);
+        if (JSON_MODE) return out(webhooks);
+        if (!webhooks.length) {
+          out("\n  No webhooks. Add one with `dock webhook add --url ...`\n");
+          return;
+        }
+        out("\n");
+        for (const w of webhooks) {
+          const events = Array.isArray(w.events) ? w.events.join(",") : "";
+          out(
+            `  ${w.id}  ${w.active ? "ACTIVE " : "PAUSED "}  ${w.url}\n`
+          );
+          out(`    events: ${events}\n`);
+        }
+        out("\n");
+        return;
+      }
+      case "add": {
+        const { flags } = parseFlags(rest);
+        if (!flags.url) {
+          return usageError(
+            'dock webhook add --url <https://…> [--events "row.created,row.updated"]'
+          );
+        }
+        const events = flags.events
+          ? String(flags.events).split(",").map((s) => s.trim()).filter(Boolean)
+          : ["row.created", "row.updated", "row.deleted"];
+        const r = await api(`/api/orgs/${slug}/webhooks`, {
+          method: "POST",
+          body: { url: flags.url, events },
+        });
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Created ${r.webhook.id}\n`);
+        out(`  Secret (shown once, store it now):\n  ${r.webhook.secret}\n\n`);
+        return;
+      }
+      case "pause":
+      case "resume": {
+        const id = rest[0];
+        if (!id) return usageError(`dock webhook ${sub} <webhook-id>`);
+        const r = await api(`/api/orgs/${slug}/webhooks/${id}`, {
+          method: "PATCH",
+          body: { active: sub === "resume" },
+        });
+        out(`\n  ✓ ${sub === "resume" ? "Resumed" : "Paused"} ${id}\n`, r);
+        return;
+      }
+      case "rm":
+      case "delete":
+      case "remove": {
+        const id = rest[0];
+        if (!id) return usageError("dock webhook rm <webhook-id>");
+        await api(`/api/orgs/${slug}/webhooks/${id}`, { method: "DELETE" });
+        out(`\n  ✓ Removed ${id}\n`, { deleted: id });
+        return;
+      }
+      case "deliveries":
+      case "logs": {
+        const id = rest[0];
+        if (!id) return usageError("dock webhook deliveries <webhook-id>");
+        const { deliveries } = await api(
+          `/api/orgs/${slug}/webhooks/${id}/deliveries`
+        );
+        if (JSON_MODE) return out(deliveries);
+        if (!deliveries.length) {
+          out("\n  No deliveries yet.\n");
+          return;
+        }
+        out("\n");
+        for (const d of deliveries) {
+          const when = new Date(d.createdAt).toISOString().slice(0, 19).replace("T", " ");
+          out(
+            `  ${when}  ${String(d.status).padEnd(10)} ${d.event.padEnd(28)} ${
+              d.lastResponseCode ?? ""
+            }\n`
+          );
+          if (d.lastError) out(`    error: ${d.lastError}\n`);
+        }
+        out("\n");
+        return;
+      }
+      default:
+        return usageError(
+          "dock webhook <list|add|pause|resume|rm|deliveries> [args]"
+        );
+    }
+  },
+
+  // ─── API keys ──────────────────────────────────────────────────
+
+  async keys(_args) {
+    await ensureAuth();
+    const { keys } = await api("/api/keys");
+    if (JSON_MODE) return out(keys);
+    if (!keys?.length) {
+      out("\n  No keys yet. `dock key new --name <name>` to create one.\n");
+      return;
+    }
+    out("\n");
+    for (const k of keys) {
+      const status = k.revokedAt ? "revoked" : "active";
+      const last = k.lastUsedAt
+        ? new Date(k.lastUsedAt).toISOString().slice(0, 10)
+        : "never";
+      out(`  ${k.id}  ${k.keyPrefix}…  ${status.padEnd(8)} last:${last}  ${k.name || ""}\n`);
+    }
+    out("\n");
+  },
+
+  async key(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    const { flags } = parseFlags(rest);
+    await ensureAuth();
+    switch (sub) {
+      case "new":
+      case "create": {
+        if (!flags.name) {
+          return usageError(
+            "dock key new --name <name> [--workspace <slug>] [--scopes ...]"
+          );
+        }
+        const body = { name: flags.name };
+        if (flags.workspace) body.workspaceId = flags.workspace;
+        if (flags.scopes) body.scopes = String(flags.scopes).split(",");
+        const r = await api("/api/keys", { method: "POST", body });
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Created key ${r.key.id}\n`);
+        out(`  Token (shown once, store it now):\n  ${r.key.token}\n\n`);
+        return;
+      }
+      case "revoke":
+      case "rm":
+      case "delete": {
+        const id = rest[0];
+        if (!id) return usageError("dock key revoke <key-id>");
+        await api(`/api/keys/${id}`, { method: "DELETE" });
+        out(`\n  ✓ Revoked ${id}\n`, { revoked: id });
+        return;
+      }
+      default:
+        return usageError("dock key <new|revoke> [args]");
+    }
+  },
+
+  // ─── Profile / Org ────────────────────────────────────────────
+
+  async profile(args) {
+    await ensureAuth();
+    const sub = args[0];
+    if (sub === "set") {
+      const { flags } = parseFlags(args.slice(1));
+      if (!flags.name) return usageError("dock profile set --name <name>");
+      const r = await api("/api/me", { method: "PUT", body: { name: flags.name } });
+      out(`\n  ✓ Profile updated\n`, r);
+      return;
+    }
+    const me = await api("/api/me");
+    if (JSON_MODE) return out(me);
+    out("\n");
+    if (me.type === "user") {
+      out(`  ${me.name || me.email}\n`);
+      out(`  ${me.email}\n`);
+    } else {
+      out(`  ${me.name} · agent\n`);
+    }
+    out(`  org: ${me.org.name} (${me.org.slug})\n\n`);
+  },
+
+  async org(args) {
+    await ensureAuth();
+    const sub = args[0];
+    if (sub === "set") {
+      const { flags } = parseFlags(args.slice(1));
+      const body = {};
+      if (flags.name) body.name = flags.name;
+      if (flags.visibility) body.defaultWorkspaceVisibility = flags.visibility;
+      if (Object.keys(body).length === 0) {
+        return usageError("dock org set --name <name> [--visibility <private|org>]");
+      }
+      const r = await api("/api/me/org", { method: "PATCH", body });
+      out(`\n  ✓ Org updated\n`, r);
+      return;
+    }
+    const { org } = await api("/api/me/org");
+    if (JSON_MODE) return out(org);
+    out(`\n  ${org.name}  (${org.slug})\n  default visibility: ${org.defaultWorkspaceVisibility}\n\n`);
+  },
+
+  // ─── Billing ──────────────────────────────────────────────────
+
+  async billing(args) {
+    await ensureAuth();
+    const sub = args[0];
+    const rest = args.slice(1);
+    const { flags } = parseFlags(rest);
+    if (sub === "upgrade") {
+      const plan = rest.find((a) => !a.startsWith("--")) || "pro";
+      const interval = flags.annual ? "year" : "month";
+      const r = await api("/api/billing/checkout", {
+        method: "POST",
+        body: { plan, interval },
+      });
+      out(`\n  Continue checkout in your browser:\n  ${r.url}\n\n`, r);
+      openBrowser(r.url);
+      return;
+    }
+    if (sub === "downgrade") {
+      await api("/api/billing/downgrade", { method: "POST" });
+      out("\n  ✓ Downgrade scheduled. Falls back to Free at the next renewal.\n", { ok: true });
+      return;
+    }
+    if (sub === "portal") {
+      const r = await api("/api/billing/portal", { method: "POST" });
+      out(`\n  Stripe portal:\n  ${r.url}\n\n`, r);
+      openBrowser(r.url);
+      return;
+    }
+    const b = await api("/api/billing");
+    if (JSON_MODE) return out(b);
+    out(`\n  Plan: ${b.plan}`);
+    if (b.interval) out(`  (${b.interval})`);
+    out(`\n`);
+    if (b.usage) {
+      out(`  Agents: ${b.usage.agents}/${b.caps?.agents}\n`);
+      out(`  Members: ${b.usage.members}/${b.caps?.members}\n`);
+      out(`  Workspaces: ${b.usage.workspaces}/${b.caps?.workspaces}\n`);
+    }
+    out("\n");
+  },
+
+  // ─── Misc ─────────────────────────────────────────────────────
+
+  async export(args) {
+    await ensureAuth();
+    const { flags } = parseFlags(args);
+    const data = await api("/api/me/export");
+    const json = JSON.stringify(data, null, 2);
+    if (flags.out) {
+      writeFileSync(String(flags.out), json);
+      out(`\n  ✓ Wrote ${flags.out}\n`, { path: flags.out });
+    } else {
+      process.stdout.write(json + "\n");
+    }
+  },
+
+  async sessions(args) {
+    await ensureAuth();
+    const sub = args[0];
+    if (sub === "logout-all" || sub === "signout-all") {
+      await api("/api/me/sessions", { method: "DELETE" });
+      out("\n  ✓ Signed out of every session.\n", { ok: true });
+      return;
+    }
+    return usageError("dock sessions logout-all");
+  },
+
   async help() {
     console.log(`
   dock — open shared workspaces with your agents in seconds
 
-  Usage:
-    dock init [name]              Sign in + create your first workspace
-    dock login                    Sign in via browser
-    dock logout                   Clear local credentials
-    dock whoami                   Show the signed-in identity
-    dock list                     List your workspaces
-    dock new <name> [--doc]       Create a new workspace
-    dock open <name>              Open workspace in browser
-    dock rows <name>              List rows in a workspace
-    dock add <name> key=value ... Append a row
-    dock share <name> <email>     Invite a collaborator
-    dock help                     Show this help
+  Auth
+    dock init [name]                       Sign in + create first workspace
+    dock login                             Sign in via browser
+    dock logout                            Clear local credentials
+    dock whoami                            Show signed-in identity
+    dock sessions logout-all               Sign out of every session
 
-  Environment:
-    DOCK_API_URL                  API base URL (default: https://godock.ai)
+  Workspaces
+    dock list                              List your workspaces
+    dock new <name> [--doc]                Create a new workspace
+    dock open <name>                       Open in browser
+    dock rename <name> <new-name>          Rename a workspace
+    dock visibility <name> <p|o|u|p>       private|org|unlisted|public
+    dock delete <name>                     Delete (irreversible)
+    dock share <name> <email> [role]       Invite a collaborator
+    dock members <name>                    List members + pending invites
+    dock columns <name>                    List columns
 
-  Docs: https://godock.ai/docs
+  Rows
+    dock rows <name>                       List rows
+    dock add <name> key=value ...          Append a row
+    dock get <name> <row-id>               Print row data
+    dock set <name> <row-id> key=val ...   Update fields
+    dock remove <name> <row-id>            Delete a row
+    dock history <name> <row-id>           Recent change events
+
+  Doc-mode workspaces
+    dock doc <name>                        Print the rich-text doc body
+
+  Webhooks (one endpoint per org)
+    dock webhook list
+    dock webhook add --url <url> [--events "row.created,row.updated"]
+    dock webhook pause <id>
+    dock webhook resume <id>
+    dock webhook rm <id>
+    dock webhook deliveries <id>           Recent delivery attempts
+
+  API keys
+    dock keys                              List keys
+    dock key new --name <n> [--workspace <slug>]
+    dock key revoke <id>
+
+  Profile / Org
+    dock profile                           Show profile
+    dock profile set --name <name>
+    dock org                               Show org settings
+    dock org set --name <name> [--visibility private|org]
+
+  Billing
+    dock billing                           Show plan + usage
+    dock billing upgrade <pro|scale> [--annual]
+    dock billing downgrade
+    dock billing portal                    Open Stripe portal
+
+  Data
+    dock export [--out FILE]               Full GDPR JSON export
+
+  Common
+    dock help                              Show this help
+    --json                                 Machine-readable output (every command)
+
+  Environment
+    DOCK_API_URL                           API base URL (default: https://trydock.ai)
+
+  Docs: https://trydock.ai/docs
 `);
   },
 };
@@ -417,13 +967,29 @@ function usageError(msg) {
 
 // ─── Entry ─────────────────────────────────────────────────────────
 
-const [command, ...args] = process.argv.slice(2);
+// Pull --json off anywhere in argv before dispatching, so commands can
+// opt into a machine-readable output without each one having to parse
+// it themselves.
+const rawArgs = process.argv.slice(2);
+const filtered = rawArgs.filter((a) => {
+  if (a === "--json") {
+    JSON_MODE = true;
+    return false;
+  }
+  return true;
+});
+
+const [command, ...args] = filtered;
 
 if (!command || command === "help" || command === "--help" || command === "-h") {
   commands.help();
 } else if (commands[command]) {
   commands[command](args).catch((err) => {
-    console.error(`\n  Error: ${err.message}\n`);
+    if (JSON_MODE) {
+      process.stdout.write(JSON.stringify({ error: err.message, status: err.status, data: err.data }, null, 2) + "\n");
+    } else {
+      console.error(`\n  Error: ${err.message}\n`);
+    }
     process.exit(1);
   });
 } else {
