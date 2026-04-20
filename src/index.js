@@ -99,7 +99,7 @@ function openBrowser(url) {
  *   3. Open browser to /oauth/authorize with code_challenge.
  *   4. On redirect, exchange the code for a token at /oauth/token.
  */
-async function oauthFlow() {
+async function oauthFlow({ ref } = {}) {
   // Ephemeral local HTTP server for the redirect.
   const { port, once } = await ephemeralServer();
   const redirectUri = `http://127.0.0.1:${port}/callback`;
@@ -127,6 +127,10 @@ async function oauthFlow() {
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
   authorizeUrl.searchParams.set("state", state);
   authorizeUrl.searchParams.set("scope", "workspace:read workspace:write");
+  // Carry a referral code through the OAuth handoff. The authorize page
+  // forwards it to /login?ref=… for new-account signups against the
+  // invite-only gate; harmless for sign-in of existing accounts.
+  if (ref) authorizeUrl.searchParams.set("ref", ref);
 
   console.log("\n  Opening your browser to sign in…");
   console.log(`  ${authorizeUrl.toString()}\n`);
@@ -252,13 +256,34 @@ function confirm(prompt) {
 
 // ─── Command implementations ──────────────────────────────────────
 
-async function ensureAuth() {
+async function ensureAuth({ ref } = {}) {
   const cfg = readConfig();
   if (cfg.accessToken) return cfg;
-  const tok = await oauthFlow();
+  const tok = await oauthFlow({ ref });
   const next = { ...cfg, ...tok };
   writeConfig(next);
   return next;
+}
+
+/**
+ * Pull a referral code out of either a bare code or a full
+ * `https://trydock.ai/invite/<code>` URL — whichever a user pastes
+ * after `--ref`. Returns null if the input doesn't look like either.
+ */
+function parseRefArg(input) {
+  if (!input || typeof input !== "string") return null;
+  const trimmed = input.trim();
+  // Full URL form.
+  try {
+    const u = new URL(trimmed);
+    const m = u.pathname.match(/\/invite\/([A-Za-z0-9_-]{1,64})\/?$/);
+    if (m) return m[1];
+  } catch {
+    // Not a URL — fall through to treat as a bare code.
+  }
+  // Bare code: alphanumeric/underscore/hyphen, ≤64 chars.
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(trimmed)) return trimmed;
+  return null;
 }
 
 /** Lazy-fetch and cache the caller's org slug. Used by every org-scoped
@@ -292,7 +317,19 @@ function parseKv(parts) {
 
 const commands = {
   async init(args) {
-    const cfg = await ensureAuth();
+    const { positional, flags } = parseFlags(args);
+    let ref = null;
+    if (flags.ref) {
+      ref = parseRefArg(flags.ref);
+      if (!ref) {
+        console.error(
+          "  --ref expects a code (e.g. abc123) or a full referral URL\n" +
+            "  like https://trydock.ai/invite/abc123."
+        );
+        process.exit(1);
+      }
+    }
+    const cfg = await ensureAuth({ ref });
     // Fetch /api/me to confirm we're signed in.
     let me;
     try {
@@ -308,7 +345,7 @@ const commands = {
     const { workspaces } = await api("/api/workspaces", { token: cfg.accessToken });
     let ws;
     if (workspaces.length === 0) {
-      const name = args[0] || "my-workspace";
+      const name = positional[0] || "my-workspace";
       console.log(`  ✓ Creating workspace "${name}"…`);
       const res = await api("/api/workspaces", {
         method: "POST",
@@ -328,8 +365,20 @@ const commands = {
     console.log();
   },
 
-  async login() {
-    const tok = await oauthFlow();
+  async login(args) {
+    const { flags } = parseFlags(args || []);
+    let ref = null;
+    if (flags.ref) {
+      ref = parseRefArg(flags.ref);
+      if (!ref) {
+        console.error(
+          "  --ref expects a code (e.g. abc123) or a full referral URL\n" +
+            "  like https://trydock.ai/invite/abc123."
+        );
+        process.exit(1);
+      }
+    }
+    const tok = await oauthFlow({ ref });
     const cfg = { ...readConfig(), ...tok };
     writeConfig(cfg);
     const me = await api("/api/me", { token: tok.accessToken });
@@ -884,11 +933,15 @@ const commands = {
   dock — open shared workspaces with your agents in seconds
 
   Auth
-    dock init [name]                       Sign in + create first workspace
-    dock login                             Sign in via browser
+    dock init [name] [--ref <code|url>]    Sign in + create first workspace
+    dock login [--ref <code|url>]          Sign in via browser
     dock logout                            Clear local credentials
     dock whoami                            Show signed-in identity
     dock sessions logout-all               Sign out of every session
+
+    --ref carries a friend's referral code (or full
+      https://trydock.ai/invite/<code> URL) into the OAuth handoff so
+      a brand-new email can sign up against the invite-only beta gate.
 
   Workspaces
     dock list                              List your workspaces

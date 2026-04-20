@@ -24,12 +24,26 @@ dock init
 ### Auth
 
 ```
-dock init [name]                       Sign in + create first workspace
-dock login                             Sign in via browser
+dock init [name] [--ref <code|url>]    Sign in + create first workspace
+dock login [--ref <code|url>]          Sign in via browser
 dock logout                            Clear local credentials
 dock whoami                            Show signed-in identity
 dock sessions logout-all               Sign out of every session
 ```
+
+Dock is invite-only during beta. If a friend sent you a referral link
+like `https://trydock.ai/invite/abc123`, you can sign up purely from
+the terminal:
+
+```bash
+dock init --ref abc123
+# or paste the whole URL
+dock init --ref https://trydock.ai/invite/abc123
+```
+
+The code is forwarded through the OAuth handoff to the invite-only
+gate. Without `--ref`, an unknown email is added to the waitlist
+instead of getting a magic link.
 
 ### Workspaces
 
