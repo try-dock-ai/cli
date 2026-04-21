@@ -928,6 +928,96 @@ const commands = {
     return usageError("dock sessions logout-all");
   },
 
+  async support(args) {
+    await ensureAuth();
+    const sub = args[0];
+    const rest = args.slice(1);
+
+    if (!sub || sub === "list") {
+      const r = await api("/api/support");
+      const tickets = r.tickets || r;
+      if (JSON_MODE) return out(tickets);
+      if (!tickets?.length) {
+        out("\n  No tickets yet.\n");
+        return;
+      }
+      for (const t of tickets) {
+        const github = t.githubUrl ? ` · ${t.githubUrl}` : "";
+        out(`  [${t.kind}] ${t.title}  (${t.status})${github}\n`);
+      }
+      return;
+    }
+
+    if (sub === "new" || sub === "file" || sub === "create") {
+      const { flags, positional } = parseFlags(rest);
+      const kind = flags.kind || positional[0];
+      const title = flags.title || positional[1];
+      const body = flags.body || positional[2];
+      if (!kind || !title || !body) {
+        return usageError(
+          'dock support new --kind <bug|feature|billing|question|other> --title "..." --body "..."'
+        );
+      }
+      const context = flags.context ? safeJson(flags.context) : undefined;
+      const r = await api("/api/support", {
+        method: "POST",
+        body: { kind, title, body, context },
+      });
+      if (JSON_MODE) return out(r);
+      out(`\n  ✓ Ticket filed${r.githubUrl ? ` → ${r.githubUrl}` : ""}\n`);
+      return;
+    }
+
+    if (sub === "show" || sub === "get") {
+      const id = rest[0];
+      if (!id) return usageError("dock support show <ticket-id>");
+      const r = await api(`/api/support/${id}`);
+      return out(r);
+    }
+
+    return usageError(
+      "dock support [list|new|show]  (see 'dock help' for details)"
+    );
+  },
+
+  async referrals(args) {
+    await ensureAuth();
+    const sub = args[0];
+
+    if (!sub || sub === "me" || sub === "status") {
+      const r = await api("/api/referrals/me");
+      if (JSON_MODE) return out(r);
+      const link = r.code ? `${API_BASE}/invite/${r.code}` : "(none yet)";
+      out(`\n  Your referral link: ${link}\n`);
+      out(`  Signed up: ${r.signedUp || 0}\n`);
+      out(`  Activated: ${r.activated || 0}\n`);
+      out(`  Months earned: ${r.scaleMonthsEarned || 0} / ${r.rewardsCap || 3}\n`);
+      if (r.scaleUntil) {
+        const days = Math.max(
+          0,
+          Math.ceil((new Date(r.scaleUntil) - Date.now()) / (24 * 60 * 60 * 1000))
+        );
+        out(`  Scale active for ~${days} more days\n`);
+      }
+      return;
+    }
+
+    if (sub === "link" || sub === "share") {
+      const r = await api("/api/referrals/me");
+      if (!r.code) {
+        out("\n  Generating your referral code...\n");
+      }
+      const link = `${API_BASE}/invite/${r.code}`;
+      if (JSON_MODE) return out({ link, code: r.code });
+      out(`\n  ${link}\n`);
+      return;
+    }
+
+    return usageError(
+      "dock referrals [me|link]  (see 'dock help' for details)"
+    );
+  },
+
   async help() {
     console.log(`
   dock — open shared workspaces with your agents in seconds
@@ -990,6 +1080,15 @@ const commands = {
     dock billing downgrade
     dock billing portal                    Open Stripe portal
 
+  Support
+    dock support                           List your tickets
+    dock support new --kind <bug|feature|billing|question|other> --title "..." --body "..."
+    dock support show <ticket-id>
+
+  Referrals
+    dock referrals                         Your code, progress, months earned
+    dock referrals link                    Print your shareable invite URL
+
   Data
     dock export [--out FILE]               Full GDPR JSON export
 
@@ -1004,6 +1103,14 @@ const commands = {
 `);
   },
 };
+
+function safeJson(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return undefined;
+  }
+}
 
 function mcpUrl(slug) {
   const base = API_BASE.replace(/\/$/, "");
