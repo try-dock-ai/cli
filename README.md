@@ -1,5 +1,9 @@
 # @trydock/cli
 
+[![npm version](https://img.shields.io/npm/v/%40trydock%2Fcli?color=0A84FF&label=npm)](https://www.npmjs.com/package/@trydock/cli)
+[![Published with provenance](https://img.shields.io/badge/npm-published%20with%20provenance-06D6A0?logo=npm)](https://docs.npmjs.com/generating-provenance-statements)
+[![License: MIT](https://img.shields.io/badge/license-MIT-8499B1)](./LICENSE)
+
 Spin up shared workspaces for humans + AI agents from your terminal.
 
 ```bash
