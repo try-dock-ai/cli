@@ -315,6 +315,18 @@ function parseKv(parts) {
   return data;
 }
 
+/** Read all of stdin as a string. Returns "" if stdin is a TTY (no pipe). */
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    if (process.stdin.isTTY) return resolve("");
+    let buf = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk) => (buf += chunk));
+    process.stdin.on("end", () => resolve(buf.trim()));
+    process.stdin.on("error", reject);
+  });
+}
+
 const commands = {
   async init(args) {
     const { positional, flags } = parseFlags(args);
@@ -548,6 +560,36 @@ const commands = {
     out(`\n  ✓ Deleted ${slug}\n`, { deleted: slug });
   },
 
+  // `archive` is an alias for `delete` — same soft-archive semantics,
+  // restorable via `dock unarchive`. Reads more naturally in scripts.
+  async archive(args) {
+    return commands.delete(args);
+  },
+
+  async unarchive(args) {
+    await ensureAuth();
+    const slug = args[0];
+    if (!slug) return usageError("dock unarchive <workspace>");
+    const r = await api(`/api/workspaces/${slug}/unarchive`, { method: "POST" });
+    out(`\n  ✓ Restored ${slug}\n`, r);
+  },
+
+  async pin(args) {
+    await ensureAuth();
+    const slug = args[0];
+    if (!slug) return usageError("dock pin <workspace>");
+    const r = await api(`/api/workspaces/${slug}/pin`, { method: "POST" });
+    out(`\n  ✓ Pinned ${slug}\n`, r);
+  },
+
+  async unpin(args) {
+    await ensureAuth();
+    const slug = args[0];
+    if (!slug) return usageError("dock unpin <workspace>");
+    const r = await api(`/api/workspaces/${slug}/pin`, { method: "DELETE" });
+    out(`\n  ✓ Unpinned ${slug}\n`, r);
+  },
+
   // ─── Rows (additions) ──────────────────────────────────────────
 
   async get(args) {
@@ -602,6 +644,71 @@ const commands = {
     out("\n");
   },
 
+  // Bulk update rows. Reads an updates array from --file <path> or
+  // stdin so a script can paste-fill a range without firing one PATCH
+  // per cell. Body shape: { updates: [{ id, data }, ...] } — each
+  // row's data is merged into the existing JSONB blob.
+  async bulk(args) {
+    await ensureAuth();
+    const sub = args[0];
+    if (sub !== "update") return usageError("dock bulk update <workspace> [--file path] [--stdin]");
+    const slug = args[1];
+    if (!slug) return usageError("dock bulk update <workspace> [--file path] [--stdin]");
+    const { flags } = parseFlags(args.slice(2));
+    let payload;
+    if (flags.file) {
+      payload = JSON.parse(readFileSync(String(flags.file), "utf-8"));
+    } else {
+      const raw = await readStdin();
+      if (!raw) return usageError("dock bulk update <workspace> [--file path] [--stdin]");
+      payload = JSON.parse(raw);
+    }
+    const body = Array.isArray(payload) ? { updates: payload } : payload;
+    const r = await api(`/api/workspaces/${slug}/rows/bulk`, {
+      method: "PATCH",
+      body,
+    });
+    out(`\n  ✓ Updated ${r.updated} row(s)\n`, r);
+  },
+
+  // Row comments. `dock comment <list|add> <workspace> <row-id> [body]`.
+  async comment(args) {
+    await ensureAuth();
+    const sub = args[0];
+    const [slug, id, ...rest] = args.slice(1);
+    if (!sub || !slug || !id) {
+      return usageError("dock comment <list|add> <workspace> <row-id> [body]");
+    }
+    if (sub === "list" || sub === "ls") {
+      const { comments } = await api(
+        `/api/workspaces/${slug}/rows/${id}/comments`
+      );
+      if (JSON_MODE) return out(comments);
+      if (!comments.length) {
+        out("\n  (no comments)\n");
+        return;
+      }
+      out("\n");
+      for (const c of comments) {
+        const when = new Date(c.createdAt).toISOString().slice(0, 19).replace("T", " ");
+        out(`  ${when}  ${c.principalName}: ${c.body}\n`);
+      }
+      out("\n");
+      return;
+    }
+    if (sub === "add") {
+      const body = rest.join(" ").trim();
+      if (!body) return usageError("dock comment add <workspace> <row-id> <body>");
+      const r = await api(`/api/workspaces/${slug}/rows/${id}/comments`, {
+        method: "POST",
+        body: { body },
+      });
+      out(`\n  ✓ Comment added\n`, r);
+      return;
+    }
+    return usageError("dock comment <list|add> <workspace> <row-id> [body]");
+  },
+
   // ─── Columns ───────────────────────────────────────────────────
 
   async columns(args) {
@@ -628,7 +735,7 @@ const commands = {
     out("\n  Members\n");
     for (const m of members) {
       const name = m.user?.name || m.user?.email || m.agent?.name || "unknown";
-      out(`    ${m.role.padEnd(10)} ${name}\n`);
+      out(`    ${m.role.padEnd(10)} ${name}  ${m.id}\n`);
     }
     if (invites?.length) {
       out("\n  Pending invites\n");
@@ -637,15 +744,415 @@ const commands = {
     out("\n");
   },
 
+  // Per-workspace member admin (role change, removal). For org-wide
+  // membership see `dock team`.
+  async member(args) {
+    const sub = args[0];
+    const slug = args[1];
+    const memberId = args[2];
+    if (!sub || !slug || !memberId) {
+      return usageError(
+        "dock member <role|remove> <workspace> <member-id> [role]"
+      );
+    }
+    await ensureAuth();
+    if (sub === "role") {
+      const role = args[3];
+      if (!role) {
+        return usageError(
+          "dock member role <workspace> <member-id> <owner|editor|commenter|viewer>"
+        );
+      }
+      const r = await api(
+        `/api/workspaces/${slug}/members/${memberId}`,
+        { method: "PATCH", body: { role } }
+      );
+      out(`\n  ✓ Role set to ${role}\n`, r);
+      return;
+    }
+    if (sub === "rm" || sub === "remove" || sub === "delete") {
+      if (!JSON_MODE) {
+        const ok = await confirm(`Remove member ${memberId} from ${slug}?`);
+        if (!ok) {
+          out("  Cancelled.\n", { cancelled: true });
+          return;
+        }
+      }
+      await api(`/api/workspaces/${slug}/members/${memberId}`, {
+        method: "DELETE",
+      });
+      out(`\n  ✓ Removed ${memberId}\n`, { removed: memberId });
+      return;
+    }
+    return usageError("dock member <role|remove> <workspace> <member-id> [role]");
+  },
+
+  // ─── Org members + invites (Teams) ─────────────────────────────
+
+  // `dock team list`, `dock team invite [--email <e>] [--role member|admin]`,
+  // `dock team role <user-id> <member|admin>`, `dock team remove <user-id>`,
+  // `dock team resend <invite-id>`, `dock team revoke <invite-id>`.
+  async team(args) {
+    const sub = args[0] || "list";
+    const rest = args.slice(1);
+    await ensureAuth();
+    const slug = await getOrgSlug();
+
+    if (sub === "list" || sub === "ls") {
+      const r = await api(`/api/orgs/${slug}/members`);
+      if (JSON_MODE) return out(r);
+      out("\n  Members\n");
+      for (const m of r.members || []) {
+        const name = m.user?.name || m.user?.email || m.user?.id || "?";
+        out(`    ${String(m.role).padEnd(8)} ${name}  ${m.user?.id || ""}\n`);
+      }
+      if (r.invites?.length) {
+        out("\n  Pending invites\n");
+        for (const i of r.invites) {
+          const tag = i.email ? i.email : "(open link)";
+          out(`    ${String(i.role).padEnd(8)} ${tag}  ${i.id}\n`);
+        }
+      }
+      out("\n");
+      return;
+    }
+
+    if (sub === "invite") {
+      const { flags } = parseFlags(rest);
+      const body = {};
+      if (flags.email) body.email = String(flags.email);
+      if (flags.role) body.role = String(flags.role);
+      if (flags.expiresInDays) body.expiresInDays = Number(flags.expiresInDays);
+      if (flags["max-uses"]) body.maxUses = Number(flags["max-uses"]);
+      const r = await api(`/api/orgs/${slug}/invites`, {
+        method: "POST",
+        body,
+      });
+      if (JSON_MODE) return out(r);
+      const invite = r.invite || r;
+      if (invite.email) {
+        out(`\n  ✓ Invite emailed to ${invite.email}\n`);
+      } else {
+        const link = `${API_BASE}/join/${invite.token || invite.id}`;
+        out(`\n  ✓ Open-link invite created\n  ${link}\n`);
+      }
+      out("\n");
+      return;
+    }
+
+    if (sub === "role") {
+      const userId = rest[0];
+      const role = rest[1];
+      if (!userId || !role) {
+        return usageError("dock team role <user-id> <member|admin>");
+      }
+      const r = await api(`/api/orgs/${slug}/members/${userId}`, {
+        method: "PATCH",
+        body: { role },
+      });
+      out(`\n  ✓ Role set to ${role}\n`, r);
+      return;
+    }
+
+    if (sub === "rm" || sub === "remove") {
+      const userId = rest[0];
+      if (!userId) return usageError("dock team remove <user-id>");
+      if (!JSON_MODE) {
+        const ok = await confirm(`Remove ${userId} from org ${slug}?`);
+        if (!ok) {
+          out("  Cancelled.\n", { cancelled: true });
+          return;
+        }
+      }
+      await api(`/api/orgs/${slug}/members/${userId}`, { method: "DELETE" });
+      out(`\n  ✓ Removed ${userId}\n`, { removed: userId });
+      return;
+    }
+
+    if (sub === "resend") {
+      const id = rest[0];
+      if (!id) return usageError("dock team resend <invite-id>");
+      const r = await api(`/api/orgs/${slug}/invites/${id}/resend`, {
+        method: "POST",
+      });
+      out(`\n  ✓ Invite resent\n`, r);
+      return;
+    }
+
+    if (sub === "revoke") {
+      const id = rest[0];
+      if (!id) return usageError("dock team revoke <invite-id>");
+      await api(`/api/orgs/${slug}/invites/${id}`, { method: "DELETE" });
+      out(`\n  ✓ Revoked ${id}\n`, { revoked: id });
+      return;
+    }
+
+    return usageError(
+      "dock team <list|invite|role|remove|resend|revoke> ..."
+    );
+  },
+
+  // Accept a team invite by token (open-link or email-scoped). For
+  // newly-signed-up users the token will already have been consumed
+  // during signup, so this is mostly for users joining an additional
+  // org from an existing account.
+  async accept(args) {
+    await ensureAuth();
+    const token = args[0];
+    if (!token) return usageError("dock accept <invite-token>");
+    const r = await api(`/api/org-invites/${token}`, { method: "POST" });
+    out(`\n  ✓ Joined ${r.org?.slug || "org"}\n`, r);
+  },
+
+  // ─── Agents (signed agents in the caller's org) ────────────────
+
+  // `dock agents` — list. `dock agent <show|rename|archive|unarchive|invite|invites|revoke>`.
+  async agents() {
+    await ensureAuth();
+    const r = await api("/api/agents/overview");
+    if (JSON_MODE) return out(r);
+    if (!r.agents?.length) {
+      out("\n  No agents yet. Mint one in Settings · Agents.\n");
+      return;
+    }
+    out("\n  NAME".padEnd(28) + "MODEL".padEnd(20) + "OWNER\n");
+    out("  " + "─".repeat(26) + "  " + "─".repeat(18) + "  " + "─".repeat(20) + "\n");
+    for (const a of r.agents) {
+      const owner = a.creator?.name || a.creator?.email || "";
+      out(
+        "  " +
+          (a.name || "(unnamed)").padEnd(26) +
+          "  " +
+          String(a.modelHint || "").padEnd(18) +
+          "  " +
+          owner +
+          "  " +
+          a.id +
+          "\n"
+      );
+    }
+    out("\n");
+  },
+
+  async agent(args) {
+    const sub = args[0];
+    const id = args[1];
+    if (!sub) return usageError("dock agent <show|rename|archive|invite|invites|revoke> <id>");
+    await ensureAuth();
+
+    if (sub === "show" || sub === "get") {
+      // No GET /api/agents/[id] — derive from /agents/overview which
+      // returns the full per-agent snapshot the UI uses anyway.
+      if (!id) return usageError("dock agent show <id>");
+      const r = await api("/api/agents/overview");
+      const agent = (r.agents || []).find((a) => a.id === id);
+      if (!agent) {
+        throw new Error(`Agent ${id} not found in your org`);
+      }
+      return out(agent);
+    }
+    if (sub === "rename") {
+      const name = args.slice(2).join(" ").trim();
+      if (!id || !name) return usageError("dock agent rename <id> <new-name>");
+      const r = await api(`/api/agents/${id}`, {
+        method: "PATCH",
+        body: { name },
+      });
+      out(`\n  ✓ Renamed to ${name}\n`, r);
+      return;
+    }
+    if (sub === "archive" || sub === "rm" || sub === "delete") {
+      if (!id) return usageError("dock agent archive <id>");
+      if (!JSON_MODE) {
+        const ok = await confirm(
+          `Archive agent ${id}? This revokes its keys + OAuth tokens.`
+        );
+        if (!ok) {
+          out("  Cancelled.\n", { cancelled: true });
+          return;
+        }
+      }
+      const r = await api(`/api/agents/${id}`, { method: "DELETE" });
+      out(`\n  ✓ Archived ${id}\n`, r);
+      return;
+    }
+    if (sub === "invite") {
+      if (!id) return usageError("dock agent invite <id> [--workspace <ws-id>] [--expires-in-minutes N]");
+      const { flags } = parseFlags(args.slice(2));
+      const body = {};
+      if (flags.workspace) body.workspaceId = String(flags.workspace);
+      if (flags["expires-in-minutes"]) {
+        body.expiresInMinutes = Number(flags["expires-in-minutes"]);
+      }
+      const r = await api(`/api/agents/${id}/invites`, {
+        method: "POST",
+        body,
+      });
+      if (JSON_MODE) return out(r);
+      out(`\n  ✓ Agent invite minted\n`);
+      if (r.claimUrl || r.url) out(`  ${r.claimUrl || r.url}\n`);
+      if (r.token) out(`  Token (shown once): ${r.token}\n`);
+      out("\n");
+      return;
+    }
+    if (sub === "invites" || sub === "list-invites") {
+      if (!id) return usageError("dock agent invites <id>");
+      const r = await api(`/api/agents/${id}/invites`);
+      return out(r);
+    }
+    if (sub === "revoke") {
+      const inviteId = args[2];
+      if (!id || !inviteId) {
+        return usageError("dock agent revoke <agent-id> <invite-id>");
+      }
+      await api(`/api/agents/${id}/invites/${inviteId}`, { method: "DELETE" });
+      out(`\n  ✓ Revoked ${inviteId}\n`, { revoked: inviteId });
+      return;
+    }
+    return usageError(
+      "dock agent <show|rename|archive|invite|invites|revoke> <id>"
+    );
+  },
+
   // ─── Doc body ──────────────────────────────────────────────────
 
+  // Read or write the rich-text doc body. Write reads ProseMirror JSON
+  // from --file or stdin; the server validates shape via doc-guard
+  // before writing. Last-write-wins (no CRDT yet).
+  //
+  //   dock doc <workspace>                     read JSON
+  //   dock doc <workspace> --markdown          read as markdown
+  //   dock doc <workspace> --text              read as plain text
+  //   dock doc set <workspace> --file body.json
+  //   cat body.json | dock doc set <workspace>
   async doc(args) {
     await ensureAuth();
+    if (args[0] === "set" || args[0] === "write" || args[0] === "update") {
+      const slug = args[1];
+      if (!slug) return usageError("dock doc set <workspace> [--file path]");
+      const { flags } = parseFlags(args.slice(2));
+      let payload;
+      if (flags.file) {
+        payload = JSON.parse(readFileSync(String(flags.file), "utf-8"));
+      } else {
+        const raw = await readStdin();
+        if (!raw) return usageError("dock doc set <workspace> [--file path]");
+        payload = JSON.parse(raw);
+      }
+      // Accept either a bare ProseMirror doc or `{ content: ... }`.
+      const body = payload && payload.content ? payload : { content: payload };
+      const r = await api(`/api/workspaces/${slug}/doc`, {
+        method: "PUT",
+        body,
+      });
+      out(`\n  ✓ Doc updated\n`, r);
+      return;
+    }
     const [slug] = args;
-    if (!slug) return usageError("dock doc <workspace>");
-    const r = await api(`/api/workspaces/${slug}/doc`);
+    if (!slug) return usageError("dock doc <workspace> [set] [--markdown|--text]");
+    const { flags } = parseFlags(args.slice(1));
+    let qs = "";
+    if (flags.markdown) qs = "?format=markdown";
+    else if (flags.text) qs = "?format=text";
+    const r = await api(`/api/workspaces/${slug}/doc${qs}`);
     if (JSON_MODE) return out(r);
-    out(JSON.stringify(r.content, null, 2) + "\n");
+    if (flags.markdown) out(r.markdown + "\n");
+    else if (flags.text) out(r.text + "\n");
+    else out(JSON.stringify(r.content, null, 2) + "\n");
+  },
+
+  // ─── Column schema mutations ───────────────────────────────────
+
+  // `dock column add <workspace> <key> <type> [--label "..."] [--options "a,b,c"]`
+  // `dock column rm <workspace> <key>` (drops via PUT-rebuild)
+  // `dock column rename <workspace> <key> <new-label>` (PUT-rebuild)
+  async column(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    if (!sub) {
+      return usageError(
+        "dock column <add|rm|rename> <workspace> ... (see 'dock help')"
+      );
+    }
+    await ensureAuth();
+    if (sub === "add" || sub === "create") {
+      const slug = rest[0];
+      const key = rest[1];
+      const type = rest[2];
+      if (!slug || !key || !type) {
+        return usageError(
+          'dock column add <workspace> <key> <type> [--label "..."] [--options "a,b,c"]'
+        );
+      }
+      const { flags } = parseFlags(rest.slice(3));
+      const column = {
+        key,
+        type,
+        label: flags.label ? String(flags.label) : key,
+      };
+      if (flags.options) {
+        column.options = String(flags.options)
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      if (flags.description) column.description = String(flags.description);
+      if (flags.width) column.width = Number(flags.width);
+      const r = await api(`/api/workspaces/${slug}/columns`, {
+        method: "POST",
+        body: { column },
+      });
+      out(`\n  ✓ Added column "${key}" (${type})\n`, r);
+      return;
+    }
+    if (sub === "rm" || sub === "delete" || sub === "remove") {
+      const slug = rest[0];
+      const key = rest[1];
+      if (!slug || !key) return usageError("dock column rm <workspace> <key>");
+      const { columns } = await api(`/api/workspaces/${slug}/columns`);
+      const next = columns
+        .filter((c) => c.key !== key)
+        // Renumber positions to stay contiguous (PUT requires it).
+        .map((c, i) => ({ ...c, position: i }));
+      if (next.length === columns.length) {
+        return usageError(`Column "${key}" not found in ${slug}`);
+      }
+      if (!JSON_MODE) {
+        const ok = await confirm(`Drop column "${key}" from ${slug}? Cell data is lost.`);
+        if (!ok) {
+          out("  Cancelled.\n", { cancelled: true });
+          return;
+        }
+      }
+      const r = await api(`/api/workspaces/${slug}/columns`, {
+        method: "PUT",
+        body: { columns: next },
+      });
+      out(`\n  ✓ Dropped column "${key}"\n`, r);
+      return;
+    }
+    if (sub === "rename" || sub === "update") {
+      const slug = rest[0];
+      const key = rest[1];
+      const newLabel = rest.slice(2).join(" ").trim();
+      if (!slug || !key || !newLabel) {
+        return usageError("dock column rename <workspace> <key> <new-label>");
+      }
+      const { columns } = await api(`/api/workspaces/${slug}/columns`);
+      const next = columns.map((c) =>
+        c.key === key ? { ...c, label: newLabel } : c
+      );
+      if (!next.some((c) => c.key === key)) {
+        return usageError(`Column "${key}" not found in ${slug}`);
+      }
+      const r = await api(`/api/workspaces/${slug}/columns`, {
+        method: "PUT",
+        body: { columns: next },
+      });
+      out(`\n  ✓ Renamed column "${key}" to "${newLabel}"\n`, r);
+      return;
+    }
+    return usageError("dock column <add|rm|rename> <workspace> ...");
   },
 
   // ─── Webhooks (org-scoped) ─────────────────────────────────────
@@ -657,7 +1164,7 @@ const commands = {
     // doesn't surface as "fetch failed".
     if (!sub) {
       return usageError(
-        "dock webhook <list|add|pause|resume|rm|deliveries> [args]"
+        "dock webhook <list|add|update|pause|resume|rm|deliveries|retry|rotate-secret> [args]"
       );
     }
     if (sub === "add") {
@@ -752,9 +1259,75 @@ const commands = {
         out("\n");
         return;
       }
+      case "update": {
+        // Update a webhook's URL or events list. Use `pause`/`resume`
+        // for the active flag (legible verbs win over `--active=true`).
+        const id = rest[0];
+        if (!id) {
+          return usageError(
+            'dock webhook update <id> [--url <https://…>] [--events "row.created,..."]'
+          );
+        }
+        const { flags } = parseFlags(rest.slice(1));
+        const body = {};
+        if (flags.url) body.url = String(flags.url);
+        if (flags.events) {
+          body.events = String(flags.events)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        }
+        if (Object.keys(body).length === 0) {
+          return usageError(
+            'dock webhook update <id> [--url <https://…>] [--events "..."]'
+          );
+        }
+        const r = await api(`/api/orgs/${slug}/webhooks/${id}`, {
+          method: "PATCH",
+          body,
+        });
+        out(`\n  ✓ Updated ${id}\n`, r);
+        return;
+      }
+      case "retry": {
+        // Retry a single delivery by its delivery id (NOT webhook id).
+        // The cron retry loop handles automatic retries; this is the
+        // manual escape hatch for "I just fixed my server, push it now".
+        const deliveryId = rest[0];
+        if (!deliveryId) {
+          return usageError("dock webhook retry <delivery-id>");
+        }
+        const r = await api(`/api/webhook-deliveries/${deliveryId}/retry`, {
+          method: "POST",
+        });
+        out(`\n  ✓ Retry scheduled\n`, r);
+        return;
+      }
+      case "rotate-secret":
+      case "rotate": {
+        const id = rest[0];
+        if (!id) return usageError("dock webhook rotate-secret <webhook-id>");
+        if (!JSON_MODE) {
+          const ok = await confirm(
+            `Rotate secret for ${id}? Old secret stops verifying immediately.`
+          );
+          if (!ok) {
+            out("  Cancelled.\n", { cancelled: true });
+            return;
+          }
+        }
+        const r = await api(
+          `/api/orgs/${slug}/webhooks/${id}/rotate-secret`,
+          { method: "POST" }
+        );
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Secret rotated for ${id}\n`);
+        out(`  New secret (shown once, store it now):\n  ${r.webhook.secret}\n\n`);
+        return;
+      }
       default:
         return usageError(
-          "dock webhook <list|add|pause|resume|rm|deliveries> [args]"
+          "dock webhook <list|add|update|pause|resume|rm|deliveries|retry|rotate-secret> [args]"
         );
     }
   },
@@ -766,7 +1339,7 @@ const commands = {
     const rest = args.slice(1);
     if (!sub) {
       return usageError(
-        "dock surface <list|new|rename|rm> <workspace> [args]"
+        "dock surface <list|new|rename|reorder|rm> <workspace> [args]"
       );
     }
     await ensureAuth();
@@ -849,6 +1422,24 @@ const commands = {
         out(`\n  ✓ Renamed to "${r.surface.name}"\n\n`);
         return;
       }
+      case "reorder":
+      case "move": {
+        const wsName = rest[0];
+        const surfSlug = rest[1];
+        const position = Number(rest[2]);
+        if (!wsName || !surfSlug || Number.isNaN(position)) {
+          return usageError(
+            "dock surface reorder <workspace> <surface-slug> <position>"
+          );
+        }
+        const r = await api(
+          `/api/workspaces/${wsName}/surfaces/${surfSlug}`,
+          { method: "PATCH", body: { position } }
+        );
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Moved "${r.surface.slug}" to position ${r.surface.position}\n\n`);
+        return;
+      }
       case "rm":
       case "delete":
       case "remove":
@@ -872,7 +1463,7 @@ const commands = {
       }
       default:
         return usageError(
-          "dock surface <list|new|rename|rm> <workspace> [args]"
+          "dock surface <list|new|rename|reorder|rm> <workspace> [args]"
         );
     }
   },
@@ -929,8 +1520,26 @@ const commands = {
         out(`\n  ✓ Revoked ${id}\n`, { revoked: id });
         return;
       }
+      case "rotate": {
+        const id = rest[0];
+        if (!id) return usageError("dock key rotate <key-id>");
+        if (!JSON_MODE) {
+          const ok = await confirm(
+            `Rotate ${id}? Old key stops working immediately.`
+          );
+          if (!ok) {
+            out("  Cancelled.\n", { cancelled: true });
+            return;
+          }
+        }
+        const r = await api(`/api/keys/${id}/rotate`, { method: "POST" });
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Rotated ${id} → ${r.id}\n`);
+        out(`  New token (shown once, store it now):\n  ${r.key}\n\n`);
+        return;
+      }
       default:
-        return usageError("dock key <new|revoke> [args]");
+        return usageError("dock key <new|rotate|revoke> [args]");
     }
   },
 
@@ -944,6 +1553,31 @@ const commands = {
       if (!flags.name) return usageError("dock profile set --name <name>");
       const r = await api("/api/me", { method: "PUT", body: { name: flags.name } });
       out(`\n  ✓ Profile updated\n`, r);
+      return;
+    }
+    if (sub === "avatar") {
+      // Upload an image file as the user avatar. The REST endpoint
+      // expects multipart form-data; the api() helper here is JSON-only
+      // so we build a fetch by hand.
+      const file = args[1];
+      if (!file) return usageError("dock profile avatar <path-to-image>");
+      const buf = readFileSync(file);
+      const ext = (file.split(".").pop() || "png").toLowerCase();
+      const mime = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
+      const cfg = readConfig();
+      const form = new FormData();
+      form.set("file", new Blob([buf], { type: mime }), file.split("/").pop());
+      const res = await fetch(`${API_BASE}/api/me/avatar`, {
+        method: "POST",
+        headers: cfg.accessToken ? { authorization: `Bearer ${cfg.accessToken}` } : {},
+        body: form,
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      }
+      out(`\n  ✓ Avatar updated\n`, data);
       return;
     }
     const me = await api("/api/me");
@@ -961,8 +1595,9 @@ const commands = {
   async org(args) {
     await ensureAuth();
     const sub = args[0];
+    const rest = args.slice(1);
     if (sub === "set") {
-      const { flags } = parseFlags(args.slice(1));
+      const { flags } = parseFlags(rest);
       const body = {};
       if (flags.name) body.name = flags.name;
       if (flags.visibility) body.defaultWorkspaceVisibility = flags.visibility;
@@ -971,6 +1606,95 @@ const commands = {
       }
       const r = await api("/api/me/org", { method: "PATCH", body });
       out(`\n  ✓ Org updated\n`, r);
+      return;
+    }
+    if (sub === "switch") {
+      const target = rest[0];
+      if (!target) return usageError("dock org switch <org-slug-or-id>");
+      // Endpoint accepts orgId; if the caller passed a slug, look up
+      // its id from /api/me first.
+      let orgId = target;
+      if (!/^[a-z0-9]{20,}$/i.test(target)) {
+        const me = await api("/api/me");
+        const orgs = me.orgs || (me.org ? [me.org] : []);
+        const found = orgs.find((o) => o.slug === target);
+        if (!found) {
+          return usageError(`Org "${target}" not found in your account`);
+        }
+        orgId = found.id;
+      }
+      const r = await api("/api/me/active-org", {
+        method: "PATCH",
+        body: { orgId },
+      });
+      out(`\n  ✓ Active org set\n`, r);
+      // Bust the lazy cache so subsequent commands resolve to the
+      // newly-active org.
+      _meCache = null;
+      return;
+    }
+    if (sub === "view-mode") {
+      const mode = rest[0];
+      if (mode !== "single" && mode !== "all") {
+        return usageError("dock org view-mode <single|all>");
+      }
+      const r = await api("/api/me/view-mode", {
+        method: "PATCH",
+        body: { mode },
+      });
+      out(`\n  ✓ View mode set to ${mode}\n`, r);
+      return;
+    }
+    if (sub === "logo") {
+      const slug = await getOrgSlug();
+      const file = rest[0];
+      if (!file) return usageError("dock org logo <path-to-image>");
+      const buf = readFileSync(file);
+      const ext = (file.split(".").pop() || "png").toLowerCase();
+      const mime = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
+      const cfg = readConfig();
+      const form = new FormData();
+      form.set("file", new Blob([buf], { type: mime }), file.split("/").pop());
+      const res = await fetch(`${API_BASE}/api/orgs/${slug}/logo`, {
+        method: "POST",
+        headers: cfg.accessToken ? { authorization: `Bearer ${cfg.accessToken}` } : {},
+        body: form,
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      }
+      out(`\n  ✓ Logo updated\n`, data);
+      return;
+    }
+    if (sub === "branding") {
+      const slug = await getOrgSlug();
+      const { flags } = parseFlags(rest);
+      const body = {};
+      if (flags["primary-color"]) body.primaryColor = String(flags["primary-color"]);
+      if (flags["accent-color"]) body.accentColor = String(flags["accent-color"]);
+      if (flags["logo-url"]) body.logoUrl = String(flags["logo-url"]);
+      if (Object.keys(body).length === 0) {
+        return usageError(
+          "dock org branding [--primary-color #hex] [--accent-color #hex] [--logo-url url]"
+        );
+      }
+      const r = await api(`/api/orgs/${slug}/branding`, {
+        method: "PATCH",
+        body,
+      });
+      out(`\n  ✓ Branding updated\n`, r);
+      return;
+    }
+    if (sub === "slug-check" || sub === "check-slug") {
+      const candidate = rest[0];
+      if (!candidate) return usageError("dock org slug-check <candidate>");
+      const r = await api(
+        `/api/orgs/slug-availability?slug=${encodeURIComponent(candidate)}`
+      );
+      if (JSON_MODE) return out(r);
+      out(r.available ? `\n  ✓ "${candidate}" is available\n\n` : `\n  ✗ "${candidate}" is taken\n\n`);
       return;
     }
     const { org } = await api("/api/me/org");
@@ -1005,6 +1729,25 @@ const commands = {
       const r = await api("/api/billing/portal", { method: "POST" });
       out(`\n  Stripe portal:\n  ${r.url}\n\n`, r);
       openBrowser(r.url);
+      return;
+    }
+    if (sub === "limit-increase" || sub === "increase") {
+      // Ask for a cap past Scale without filing a support ticket.
+      // kind: agents / workspaces / rows / other.
+      const kind = flags.kind || rest[0];
+      if (!kind) {
+        return usageError(
+          'dock billing limit-increase --kind <agents|workspaces|rows|other> [--desired N] [--reason "..."]'
+        );
+      }
+      const body = { kind };
+      if (flags.desired) body.desiredValue = Number(flags.desired);
+      if (flags.reason) body.reason = String(flags.reason);
+      const r = await api("/api/billing/request-limit-increase", {
+        method: "POST",
+        body,
+      });
+      out(`\n  ✓ Limit increase requested. We'll be in touch.\n`, r);
       return;
     }
     const b = await api("/api/billing");
@@ -1093,9 +1836,75 @@ const commands = {
       return out(r);
     }
 
+    if (sub === "upload") {
+      const file = rest[0];
+      if (!file) return usageError("dock support upload <path-to-file>");
+      const buf = readFileSync(file);
+      // The endpoint accepts any content type the user might attach to
+      // a ticket — guess from extension, default to octet-stream.
+      const ext = (file.split(".").pop() || "").toLowerCase();
+      const mimeMap = {
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        gif: "image/gif",
+        webp: "image/webp",
+        pdf: "application/pdf",
+        txt: "text/plain",
+        log: "text/plain",
+        json: "application/json",
+      };
+      const mime = mimeMap[ext] || "application/octet-stream";
+      const cfg = readConfig();
+      const form = new FormData();
+      form.set("file", new Blob([buf], { type: mime }), file.split("/").pop());
+      const res = await fetch(`${API_BASE}/api/support/upload`, {
+        method: "POST",
+        headers: cfg.accessToken ? { authorization: `Bearer ${cfg.accessToken}` } : {},
+        body: form,
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!res.ok) {
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      }
+      if (JSON_MODE) return out(data);
+      out(`\n  ✓ Uploaded\n  ${data.url || data.attachmentUrl || ""}\n\n`);
+      return;
+    }
+
     return usageError(
-      "dock support [list|new|show]  (see 'dock help' for details)"
+      "dock support [list|new|show|upload]  (see 'dock help' for details)"
     );
+  },
+
+  // Full-text search across workspaces / rows / doc-sections.
+  //   dock search "query"
+  //   dock search "query" --kind workspace  # or row | doc-section
+  //   dock search "query" --limit 20 --offset 0
+  async search(args) {
+    await ensureAuth();
+    const { positional, flags } = parseFlags(args);
+    const q = positional.join(" ").trim();
+    if (!q) return usageError('dock search "query" [--kind workspace|row|doc-section] [--limit N]');
+    const params = new URLSearchParams({ q });
+    if (flags.kind) params.set("kind", String(flags.kind));
+    if (flags.limit) params.set("limit", String(flags.limit));
+    if (flags.offset) params.set("offset", String(flags.offset));
+    const r = await api(`/api/search?${params}`);
+    if (JSON_MODE) return out(r);
+    if (!r.results?.length) {
+      out("\n  No matches.\n");
+      return;
+    }
+    out("\n");
+    for (const hit of r.results) {
+      const tag = String(hit.kind || "?").padEnd(12);
+      const title = hit.title || hit.snippet || hit.id;
+      out(`  ${tag} ${title}\n`);
+      if (hit.workspaceSlug) out(`               ${webUrl(hit.workspaceSlug)}\n`);
+    }
+    out("\n");
   },
 
   async referrals(args) {
@@ -1157,15 +1966,20 @@ const commands = {
     dock open <name>                       Open in browser
     dock rename <name> <new-name>          Rename a workspace
     dock visibility <name> <p|o|u|p>       private|org|unlisted|public
-    dock delete <name>                     Delete (irreversible)
-    dock share <name> <email> [role]       Invite a collaborator
+    dock pin <name>                        Pin to your sidebar
+    dock unpin <name>                      Unpin from your sidebar
+    dock archive <name>                    Soft-archive (alias: delete)
+    dock unarchive <name>                  Restore an archived workspace
+    dock share <name> <email> [role]       Invite a collaborator (workspace-scoped)
     dock members <name>                    List members + pending invites
-    dock columns <name>                    List columns
+    dock member role <ws> <member-id> <role>
+    dock member remove <ws> <member-id>
 
   Surfaces (tabs inside a workspace)
     dock surface list <name> [--archived]
     dock surface new <name> <surface-name> [--doc] [--slug <s>]
     dock surface rename <name> <surface-slug> <new-name>
+    dock surface reorder <name> <surface-slug> <position>
     dock surface rm <name> <surface-slug>
 
   Rows
@@ -1173,41 +1987,86 @@ const commands = {
     dock add <name> key=value ...          Append a row
     dock get <name> <row-id>               Print row data
     dock set <name> <row-id> key=val ...   Update fields
+    dock bulk update <name> [--file p|--stdin]   Batch update (PATCH /rows/bulk)
     dock remove <name> <row-id>            Delete a row
     dock history <name> <row-id>           Recent change events
+    dock comment list <name> <row-id>      List comments on a row
+    dock comment add <name> <row-id> <body>
 
-  Doc-mode workspaces
-    dock doc <name>                        Print the rich-text doc body
+  Columns
+    dock columns <name>                    List columns
+    dock column add <name> <key> <type> [--label "..."] [--options "a,b,c"]
+    dock column rename <name> <key> <new-label>
+    dock column rm <name> <key>            Drop a column (cell data lost)
+
+  Docs (rich-text body — every workspace has one)
+    dock doc <name> [--markdown|--text]    Print the doc body
+    dock doc set <name> [--file p|--stdin] Replace the body (ProseMirror JSON)
+
+  Teams (org membership)
+    dock team list                         List org members + pending invites
+    dock team invite [--email e] [--role member|admin] [--max-uses N] [--expires-in-days N]
+    dock team role <user-id> <member|admin>
+    dock team remove <user-id>
+    dock team resend <invite-id>
+    dock team revoke <invite-id>
+    dock accept <invite-token>             Accept a team invite
+
+  Agents (signed agents in your org)
+    dock agents                            List agents with usage
+    dock agent show <id>
+    dock agent rename <id> <new-name>
+    dock agent archive <id>                Revokes keys + OAuth tokens
+    dock agent invite <id> [--workspace <ws-id>] [--expires-in-minutes N]
+    dock agent invites <id>                List outstanding invites
+    dock agent revoke <id> <invite-id>
 
   Webhooks (one endpoint per org)
     dock webhook list
     dock webhook add --url <url> [--events "row.created,row.updated"]
+    dock webhook update <id> [--url u] [--events "..."]
     dock webhook pause <id>
     dock webhook resume <id>
     dock webhook rm <id>
     dock webhook deliveries <id>           Recent delivery attempts
+    dock webhook retry <delivery-id>       Manually retry one delivery
+    dock webhook rotate-secret <id>        Mint a fresh signing secret
 
   API keys
     dock keys                              List keys
     dock key new --name <n> [--workspace <slug>]
+    dock key rotate <id>                   Atomic mint-new + revoke-old
     dock key revoke <id>
 
-  Profile / Org
+  Profile
     dock profile                           Show profile
     dock profile set --name <name>
-    dock org                               Show org settings
+    dock profile avatar <path-to-image>    Upload a new avatar
+
+  Org
+    dock org                               Show active org settings
     dock org set --name <name> [--visibility private|org]
+    dock org switch <slug-or-id>           Switch your active org
+    dock org view-mode <single|all>        Sidebar: one org or all orgs
+    dock org logo <path-to-image>          Upload an org logo
+    dock org branding [--primary-color #hex] [--accent-color #hex] [--logo-url u]
+    dock org slug-check <candidate>        Is this org slug taken?
 
   Billing
     dock billing                           Show plan + usage
     dock billing upgrade <pro|scale> [--annual]
     dock billing downgrade
     dock billing portal                    Open Stripe portal
+    dock billing limit-increase --kind <agents|workspaces|rows|other> [--desired N] [--reason "..."]
 
   Support
     dock support                           List your tickets
     dock support new --kind <bug|feature|billing|question|other> --title "..." --body "..."
     dock support show <ticket-id>
+    dock support upload <path-to-file>     Attach a screenshot or log
+
+  Search
+    dock search "query" [--kind workspace|row|doc-section] [--limit N]
 
   Referrals
     dock referrals                         Your code, progress, months earned
