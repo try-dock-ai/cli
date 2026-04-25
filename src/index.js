@@ -759,6 +759,124 @@ const commands = {
     }
   },
 
+  // ─── Surfaces (tabs inside a workspace) ────────────────────────
+
+  async surface(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    if (!sub) {
+      return usageError(
+        "dock surface <list|new|rename|rm> <workspace> [args]"
+      );
+    }
+    await ensureAuth();
+    switch (sub) {
+      case "list": {
+        const wsName = rest[0];
+        if (!wsName) return usageError("dock surface list <workspace>");
+        const { flags } = parseFlags(rest.slice(1));
+        const qs = flags.archived ? "?archived=1" : "";
+        const { surfaces } = await api(
+          `/api/workspaces/${wsName}/surfaces${qs}`
+        );
+        if (JSON_MODE) return out(surfaces);
+        if (!surfaces.length) {
+          out("\n  No surfaces.\n");
+          return;
+        }
+        out("\n");
+        out(
+          "  SLUG".padEnd(28) +
+            "KIND".padEnd(8) +
+            "POS".padEnd(6) +
+            "NAME"
+        );
+        out("\n  " + "─".repeat(26) + "  " + "─".repeat(6) + "  " + "─".repeat(4) + "  " + "─".repeat(4));
+        for (const s of surfaces) {
+          out(
+            "\n  " +
+              String(s.slug).padEnd(26) +
+              "  " +
+              String(s.kind).padEnd(6) +
+              "  " +
+              String(s.position).padEnd(4) +
+              "  " +
+              s.name +
+              (s.archivedAt ? "  (archived)" : "")
+          );
+        }
+        out("\n\n");
+        return;
+      }
+      case "new":
+      case "create": {
+        const wsName = rest[0];
+        const name = rest[1];
+        if (!wsName || !name) {
+          return usageError(
+            "dock surface new <workspace> <name> [--doc] [--slug <s>]"
+          );
+        }
+        const { flags } = parseFlags(rest.slice(2));
+        const kind = flags.doc ? "doc" : "table";
+        const body = { kind, name };
+        if (flags.slug) body.slug = String(flags.slug);
+        const r = await api(`/api/workspaces/${wsName}/surfaces`, {
+          method: "POST",
+          body,
+        });
+        if (JSON_MODE) return out(r);
+        out(
+          `\n  ✓ Created ${r.surface.kind} surface "${r.surface.name}" → ${r.surface.slug}\n`
+        );
+        out(`  Open: ${webUrl(wsName)}?surface=${r.surface.slug}\n\n`);
+        return;
+      }
+      case "rename": {
+        const wsName = rest[0];
+        const surfSlug = rest[1];
+        const newName = rest.slice(2).join(" ");
+        if (!wsName || !surfSlug || !newName) {
+          return usageError(
+            "dock surface rename <workspace> <surface-slug> <new-name>"
+          );
+        }
+        const r = await api(
+          `/api/workspaces/${wsName}/surfaces/${surfSlug}`,
+          { method: "PATCH", body: { name: newName } }
+        );
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Renamed to "${r.surface.name}"\n\n`);
+        return;
+      }
+      case "rm":
+      case "delete":
+      case "remove":
+      case "archive": {
+        const wsName = rest[0];
+        const surfSlug = rest[1];
+        if (!wsName || !surfSlug) {
+          return usageError("dock surface rm <workspace> <surface-slug>");
+        }
+        if (!JSON_MODE && !confirm(`  Archive surface "${surfSlug}"? (y/N) `)) {
+          out("  Aborted.\n");
+          return;
+        }
+        const r = await api(
+          `/api/workspaces/${wsName}/surfaces/${surfSlug}`,
+          { method: "DELETE" }
+        );
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Archived ${surfSlug}\n\n`);
+        return;
+      }
+      default:
+        return usageError(
+          "dock surface <list|new|rename|rm> <workspace> [args]"
+        );
+    }
+  },
+
   // ─── API keys ──────────────────────────────────────────────────
 
   async keys(_args) {
@@ -1043,6 +1161,12 @@ const commands = {
     dock share <name> <email> [role]       Invite a collaborator
     dock members <name>                    List members + pending invites
     dock columns <name>                    List columns
+
+  Surfaces (tabs inside a workspace)
+    dock surface list <name> [--archived]
+    dock surface new <name> <surface-name> [--doc] [--slug <s>]
+    dock surface rename <name> <surface-slug> <new-name>
+    dock surface rm <name> <surface-slug>
 
   Rows
     dock rows <name>                       List rows
