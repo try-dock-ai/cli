@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -23,6 +23,111 @@ const DEFAULT_API = "https://trydock.ai";
 const API_BASE = process.env.DOCK_API_URL || DEFAULT_API;
 const CONFIG_DIR = join(homedir(), ".dock");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+
+// ─── MCP client config writer table ────────────────────────────────
+//
+// `dock mcp install <client>` reads from this table to know which
+// file to edit and how to merge a `dock` server entry into the
+// existing JSON. Same paths as the @trydock/mcp README.
+//
+// `snippet(token)` returns just the dock entry — used in the error
+// path when we can't parse existing config and have to print it for
+// manual paste. `merge(existing, token)` does the full merge into
+// whatever shape the client expects (mcpServers vs context_servers
+// for Zed). Both keep the entry idempotent — running this twice
+// just overwrites the dock server with a fresh key.
+
+const DOCK_MCP_CMD = { command: "npx", args: ["-y", "@trydock/mcp"] };
+
+function dockMcpEntry(token) {
+  return { ...DOCK_MCP_CMD, env: { DOCK_API_KEY: token } };
+}
+
+const MCP_CLIENTS = {
+  "claude-code": {
+    // Claude Code stores MCP servers in `~/.claude.json` under
+    // `mcpServers.<name>`. The file is shared with other Claude Code
+    // settings (projects, sessions, etc.), so the merge pattern is
+    // important: never replace the whole file, only add/update the
+    // single `mcpServers.dock` key.
+    path: "~/.claude.json",
+    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    merge: (cur, t) => ({
+      ...cur,
+      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  "claude-desktop": {
+    // macOS path. Linux/Windows users will need to symlink or copy
+    // — the @trydock/mcp README documents the cross-OS variants.
+    path: "~/Library/Application Support/Claude/claude_desktop_config.json",
+    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    merge: (cur, t) => ({
+      ...cur,
+      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  cursor: {
+    path: "~/.cursor/mcp.json",
+    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    merge: (cur, t) => ({
+      ...cur,
+      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  windsurf: {
+    path: "~/.codeium/windsurf/mcp_config.json",
+    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    merge: (cur, t) => ({
+      ...cur,
+      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  zed: {
+    // Zed uses `context_servers` inside the global settings file.
+    // Settings file is JSONC in the wild but most installs work
+    // with strict JSON; we write strict JSON and trust the editor
+    // to round-trip it. If the user has comments, parsing will
+    // fail and we fall through to print-the-snippet.
+    path: "~/.config/zed/settings.json",
+    snippet: (t) => ({ context_servers: { dock: DOCK_MCP_CMD } }),
+    merge: (cur, t) => ({
+      ...cur,
+      context_servers: { ...(cur.context_servers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  cline: {
+    // Cline (VS Code extension) reads from a settings JSON the user
+    // has to point us at. We default to the macOS user settings;
+    // override with --path on the (future) flag.
+    path: "~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    merge: (cur, t) => ({
+      ...cur,
+      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+    }),
+  },
+  continue: {
+    // Continue puts MCP servers under `experimental.mcpServers`, not
+    // top-level `mcpServers`. (Per the /docs/connect/continue page +
+    // Continue's own docs as of 2026-04.) Mark as experimental until
+    // they promote it.
+    path: "~/.continue/config.json",
+    snippet: (t) => ({
+      experimental: { mcpServers: { dock: dockMcpEntry(t) } },
+    }),
+    merge: (cur, t) => ({
+      ...cur,
+      experimental: {
+        ...(cur.experimental || {}),
+        mcpServers: {
+          ...(cur.experimental?.mcpServers || {}),
+          dock: dockMcpEntry(t),
+        },
+      },
+    }),
+  },
+};
 
 function readConfig() {
   if (!existsSync(CONFIG_FILE)) return {};
@@ -99,7 +204,7 @@ function openBrowser(url) {
  *   3. Open browser to /oauth/authorize with code_challenge.
  *   4. On redirect, exchange the code for a token at /oauth/token.
  */
-async function oauthFlow({ ref } = {}) {
+async function oauthFlow({ ref, email } = {}) {
   // Ephemeral local HTTP server for the redirect.
   const { port, once } = await ephemeralServer();
   const redirectUri = `http://127.0.0.1:${port}/callback`;
@@ -131,9 +236,20 @@ async function oauthFlow({ ref } = {}) {
   // forwards it to /login?ref=… for new-account signups against the
   // invite-only gate; harmless for sign-in of existing accounts.
   if (ref) authorizeUrl.searchParams.set("ref", ref);
+  // Pre-supply the email so the customer doesn't have to type it in the
+  // browser form. Authorize page reads ?email= and skips straight to
+  // "we sent you a sign-in link" — agent-friendly because the customer
+  // just clicks the email link, no in-browser typing.
+  if (email) authorizeUrl.searchParams.set("email", email);
 
-  console.log("\n  Opening your browser to sign in…");
-  console.log(`  ${authorizeUrl.toString()}\n`);
+  if (email) {
+    console.log(`\n  Sending a sign-in link to ${email}…`);
+    console.log(`  Click the link from your inbox; this terminal continues automatically.`);
+    console.log(`  ${authorizeUrl.toString()}\n`);
+  } else {
+    console.log("\n  Opening your browser to sign in…");
+    console.log(`  ${authorizeUrl.toString()}\n`);
+  }
   openBrowser(authorizeUrl.toString());
 
   // 3. Wait for callback.
@@ -256,10 +372,10 @@ function confirm(prompt) {
 
 // ─── Command implementations ──────────────────────────────────────
 
-async function ensureAuth({ ref } = {}) {
+async function ensureAuth({ ref, email } = {}) {
   const cfg = readConfig();
   if (cfg.accessToken) return cfg;
-  const tok = await oauthFlow({ ref });
+  const tok = await oauthFlow({ ref, email });
   const next = { ...cfg, ...tok };
   writeConfig(next);
   return next;
@@ -341,7 +457,13 @@ const commands = {
         process.exit(1);
       }
     }
-    const cfg = await ensureAuth({ ref });
+    // `--email` lets the agent driving this CLI pre-supply the email so
+    // the customer doesn't have to type it in the OAuth browser form. The
+    // authorize page reads ?email= and skips the form, going straight to
+    // "we sent you a sign-in link" while the localhost listener waits.
+    // See dock-app/src/app/oauth/authorize/page.tsx for the server side.
+    const email = typeof flags.email === "string" ? flags.email : undefined;
+    const cfg = await ensureAuth({ ref, email });
     // Fetch /api/me to confirm we're signed in.
     let me;
     try {
@@ -390,7 +512,8 @@ const commands = {
         process.exit(1);
       }
     }
-    const tok = await oauthFlow({ ref });
+    const email = typeof flags.email === "string" ? flags.email : undefined;
+    const tok = await oauthFlow({ ref, email });
     const cfg = { ...readConfig(), ...tok };
     writeConfig(cfg);
     const me = await api("/api/me", { token: tok.accessToken });
@@ -1497,12 +1620,14 @@ const commands = {
     switch (sub) {
       case "new":
       case "create": {
-        if (!flags.name) {
-          return usageError(
-            "dock key new --name <name> [--workspace <slug>] [--scopes ...]"
-          );
-        }
-        const body = { name: flags.name };
+        // Default the name when omitted so an agent driving the CLI
+        // (Claude Code, etc.) doesn't error out on the marketing
+        // snippet `dock key new`. Falls back to `agent-<host>-<ts>` so
+        // the key is identifiable in `dock key list` later.
+        const name =
+          (typeof flags.name === "string" && flags.name) ||
+          `agent-${(process.env.HOSTNAME || hostname() || "key").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24)}-${Date.now().toString(36)}`;
+        const body = { name };
         if (flags.workspace) body.workspaceId = flags.workspace;
         if (flags.scopes) body.scopes = String(flags.scopes).split(",");
         const r = await api("/api/keys", { method: "POST", body });
@@ -1541,6 +1666,98 @@ const commands = {
       default:
         return usageError("dock key <new|rotate|revoke> [args]");
     }
+  },
+
+  // ─── MCP install — writes an `@trydock/mcp` config block to the
+  //  right path for the named agent client + inlines a fresh API key.
+  //  Closes the loop on the agent-onboarding flow so a Claude Code /
+  //  Cursor / Claude Desktop session goes from `npx -y @trydock/cli
+  //  mcp install <client>` straight to a working tool surface.
+  //  Supported clients map to the file paths already documented in
+  //  the @trydock/mcp README.
+  async mcp(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    const { flags } = parseFlags(rest);
+    if (sub !== "install" && sub !== "setup") {
+      return usageError("dock mcp install <client> [--name <key-name>] [--key <existing-token>]");
+    }
+    const client = rest[0];
+    if (!client || client.startsWith("--")) {
+      return usageError(
+        `dock mcp install <client> — supported: ${Object.keys(MCP_CLIENTS).join(", ")}`
+      );
+    }
+    const cfg = MCP_CLIENTS[client];
+    if (!cfg) {
+      return usageError(
+        `Unknown client "${client}". Supported: ${Object.keys(MCP_CLIENTS).join(", ")}`
+      );
+    }
+    await ensureAuth();
+
+    // Either accept an already-minted key (`--key dk_...`) or mint a
+    // fresh one named for this client.
+    let token = typeof flags.key === "string" ? flags.key : null;
+    if (!token) {
+      const name =
+        (typeof flags.name === "string" && flags.name) || `${client}-${Date.now().toString(36)}`;
+      const r = await api("/api/keys", { method: "POST", body: { name } });
+      token = r.key.token;
+      if (!JSON_MODE) out(`\n  ✓ Minted key "${name}" → ${r.key.id}\n`);
+    }
+
+    // Compute the absolute config path for this client. `~` is
+    // expanded against the current user's homedir.
+    const path = cfg.path.startsWith("~")
+      ? join(homedir(), cfg.path.slice(2))
+      : cfg.path;
+
+    // Read existing config (if any) and merge our entry. If the file
+    // doesn't exist yet, start with an empty object. If it exists but
+    // is unparseable, refuse to clobber — print the snippet and ask
+    // the user to add it manually.
+    let existing = {};
+    if (existsSync(path)) {
+      try {
+        existing = JSON.parse(readFileSync(path, "utf8"));
+      } catch (e) {
+        if (JSON_MODE) {
+          return out({
+            error: "config_unparseable",
+            path,
+            snippet: cfg.snippet(token),
+          });
+        }
+        out(
+          `\n  ! Couldn't parse existing config at ${path} (${e.message}).\n` +
+            `  Skipping write to avoid clobbering. Add this block manually:\n\n` +
+            JSON.stringify(cfg.snippet(token), null, 2) +
+            "\n\n"
+        );
+        return;
+      }
+    }
+
+    // Merge under the client's mcpServers (or context_servers, etc)
+    // root key. If a `dock` entry already exists, replace it — that's
+    // the rotate-key flow.
+    const merged = cfg.merge(existing, token);
+
+    // Ensure parent dir exists. Some configs live at deep paths
+    // (~/.config/zed/) that the user may not have created yet.
+    const dir = path.replace(/\/[^/]+$/, "");
+    if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+    writeFileSync(path, JSON.stringify(merged, null, 2) + "\n", "utf8");
+
+    if (JSON_MODE) {
+      return out({ ok: true, client, path, configured: true });
+    }
+    out(
+      `\n  ✓ Wrote MCP config for ${client} → ${path}\n` +
+        `  Restart your agent. Dock's tools (8) will appear in the next session.\n\n`
+    );
   },
 
   // ─── Profile / Org ────────────────────────────────────────────
@@ -1950,8 +2167,14 @@ const commands = {
   dock — open shared workspaces with your agents in seconds
 
   Auth
-    dock init [name] [--ref <code|url>]    Sign in + create first workspace
-    dock login [--ref <code|url>]          Sign in via browser
+    dock init [name] [--email <e>] [--ref <code|url>]
+                                           Sign in + create first workspace.
+                                           --email pre-supplies the email so
+                                           the OAuth browser skips the form;
+                                           customer just clicks the link in
+                                           their inbox. Agent-friendly.
+    dock login [--email <e>] [--ref <code|url>]
+                                           Sign in via browser
     dock logout                            Clear local credentials
     dock whoami                            Show signed-in identity
     dock sessions logout-all               Sign out of every session
@@ -2034,9 +2257,16 @@ const commands = {
 
   API keys
     dock keys                              List keys
-    dock key new --name <n> [--workspace <slug>]
+    dock key new [--name <n>] [--workspace <slug>]
     dock key rotate <id>                   Atomic mint-new + revoke-old
     dock key revoke <id>
+
+  MCP install (one-shot agent setup)
+    dock mcp install <client>              Mints a key + writes the right MCP
+                                           config for that client. Supported:
+                                           claude-code, claude-desktop, cursor,
+                                           windsurf, zed, cline, continue.
+                                           Use --key <existing> to skip the mint.
 
   Profile
     dock profile                           Show profile
