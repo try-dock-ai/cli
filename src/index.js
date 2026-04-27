@@ -45,7 +45,12 @@ function dockMcpEntry(token) {
 
 const MCP_CLIENTS = {
   "claude-code": {
-    path: "~/.claude/mcp.json",
+    // Claude Code stores MCP servers in `~/.claude.json` under
+    // `mcpServers.<name>`. The file is shared with other Claude Code
+    // settings (projects, sessions, etc.), so the merge pattern is
+    // important: never replace the whole file, only add/update the
+    // single `mcpServers.dock` key.
+    path: "~/.claude.json",
     snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
     merge: (cur, t) => ({
       ...cur,
@@ -103,11 +108,23 @@ const MCP_CLIENTS = {
     }),
   },
   continue: {
+    // Continue puts MCP servers under `experimental.mcpServers`, not
+    // top-level `mcpServers`. (Per the /docs/connect/continue page +
+    // Continue's own docs as of 2026-04.) Mark as experimental until
+    // they promote it.
     path: "~/.continue/config.json",
-    snippet: (t) => ({ mcpServers: { dock: dockMcpEntry(t) } }),
+    snippet: (t) => ({
+      experimental: { mcpServers: { dock: dockMcpEntry(t) } },
+    }),
     merge: (cur, t) => ({
       ...cur,
-      mcpServers: { ...(cur.mcpServers || {}), dock: dockMcpEntry(t) },
+      experimental: {
+        ...(cur.experimental || {}),
+        mcpServers: {
+          ...(cur.experimental?.mcpServers || {}),
+          dock: dockMcpEntry(t),
+        },
+      },
     }),
   },
 };
