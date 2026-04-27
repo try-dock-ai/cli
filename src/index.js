@@ -298,10 +298,31 @@ function ephemeralServer() {
       }
       res.writeHead(200, { "content-type": "text/html" });
       res.end(
-        `<!doctype html><html><head><meta charset="utf-8"><title>Dock CLI</title>
-<style>html,body{margin:0;padding:0;height:100%;background:#0F1722;color:#E8F1F8;font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;align-items:center;justify-content:center}
-.ok{text-align:center}.ok h1{font-size:22px;font-weight:500;margin:0 0 8px}.ok p{opacity:0.6;font-size:14px;margin:0}</style>
-</head><body><div class="ok"><h1>You're signed in</h1><p>You can close this tab and return to your terminal.</p></div></body></html>`
+        // The "return to your agent" copy is intentional: the customer
+        // running this is almost always inside an agent like Claude
+        // Code or Cursor that's driving the CLI on their behalf. "Return
+        // to your terminal" undersells that handoff — the next thing
+        // they should do is read the agent's reply, not look at a shell
+        // prompt. Mention "account" not "workspace" because at this
+        // point only OAuth has finished; workspace creation happens
+        // back in the CLI after the token exchange.
+        `<!doctype html><html><head><meta charset="utf-8"><title>Dock</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;background:#0F1722;color:#E8F1F8;font-family:-apple-system,BlinkMacSystemFont,Inter,sans-serif;display:flex;align-items:center;justify-content:center;-webkit-font-smoothing:antialiased}
+.card{text-align:center;padding:48px 32px;max-width:420px}
+.mark{width:48px;height:48px;border-radius:14px;margin:0 auto 24px;background:conic-gradient(from 220deg,#0A84FF,#FF2D92,#BF5AF2,#0A84FF);box-shadow:0 0 40px rgba(191,90,242,.35),0 0 80px rgba(255,45,146,.15)}
+h1{font-size:24px;font-weight:500;letter-spacing:-0.01em;margin:0 0 12px;color:#E8F1F8}
+p{font-size:14px;line-height:1.55;margin:0 0 8px;color:rgba(232,241,248,.7)}
+.muted{color:rgba(232,241,248,.4);font-size:13px;margin-top:24px}
+</style>
+</head><body><div class="card">
+<div class="mark" aria-hidden="true"></div>
+<h1>You're signed in</h1>
+<p>Your Dock account is ready.</p>
+<p>Return to your agent to finish setup.</p>
+<p class="muted">You can close this tab.</p>
+</div></body></html>`
       );
       const query = Object.fromEntries(url.searchParams);
       // Resolve after a tick so the response flushes.
