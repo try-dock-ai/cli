@@ -1,6 +1,6 @@
 {
   "name": "@trydock/cli",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Spin up shared workspaces for humans and AI agents from your terminal.",
   "bin": {
     "dock": "src/index.js"
@@ -12,7 +12,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test tests/*.test.js"
   },
   "homepage": "https://trydock.ai",
   "bugs": "https://github.com/try-dock-ai/cli/issues",

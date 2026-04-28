@@ -649,6 +649,149 @@ const commands = {
     console.log(`\n  ✓ Added row ${row.id} at position ${row.position}\n`);
   },
 
+  /**
+   * dock push <name> [--workspace=<slug>] [--from=<file>]
+   *
+   * Drop a doc into Dock so another agent on a different machine can
+   * pull it. Two-line ergonomics over the existing surface API:
+   *
+   *   echo "report body" | dock push report.md
+   *   dock push report.md                 # reads ./report.md
+   *   dock push report.md --workspace=team
+   *   dock push report.md --from=/tmp/x.md
+   *
+   * Defaults: lands the content in a doc surface inside the
+   * `handoff` workspace (auto-created on first push). Surface name
+   * is the original `<name>`; surface slug strips the extension and
+   * kebab-cases the rest. Subsequent pushes of the same name overwrite
+   * the surface body — same write semantics as `dock doc set`.
+   *
+   * Pairs with `dock pull` for the agent-to-agent transport flow:
+   *
+   *   machine-A$ dock push report.md
+   *   machine-B$ dock pull report.md --prompt="summarize" | claude
+   */
+  async push(args) {
+    const [name, ...rest] = args;
+    if (!name) {
+      return usageError(
+        "dock push <name> [--workspace=<slug>] [--from=<file>]"
+      );
+    }
+    const { flags } = parseFlags(rest);
+    await ensureAuth();
+    const workspaceSlug = flags.workspace ? String(flags.workspace) : "handoff";
+    const surfaceSlug = slugifyForSurface(name);
+
+    // Resolve content. Priority: explicit --from path > stdin pipe >
+    // local file at <name>. The TTY check is the standard "did
+    // someone pipe me data" trick — when stdin is a TTY there's
+    // nothing to read, so we fall through to the file path.
+    let content;
+    if (flags.from) {
+      try {
+        content = readFileSync(String(flags.from), "utf-8");
+      } catch (e) {
+        throw new Error(
+          `Couldn't read --from=${flags.from}: ${e.message ?? e}`
+        );
+      }
+    } else if (!process.stdin.isTTY) {
+      content = await readStdin();
+    } else {
+      try {
+        content = readFileSync(name, "utf-8");
+      } catch {
+        return usageError(
+          `No content. Pipe via stdin or pass --from=<file>: dock push ${name} --from=./path.md`
+        );
+      }
+    }
+    if (!content || !content.trim()) {
+      throw new Error("Refusing to push empty content");
+    }
+
+    // Make sure the workspace exists (auto-create on first push).
+    await ensureHandoffWorkspace(workspaceSlug);
+
+    // Make sure the doc surface exists (idempotent — pre-existing
+    // surface short-circuits the create).
+    await ensureDocSurface(workspaceSlug, surfaceSlug, name);
+
+    await api(
+      `/api/workspaces/${workspaceSlug}/doc?surface=${encodeURIComponent(surfaceSlug)}`,
+      { method: "PUT", body: { markdown: content } }
+    );
+
+    if (JSON_MODE) {
+      out({
+        pushed: true,
+        workspace: workspaceSlug,
+        surface: surfaceSlug,
+        name,
+        bytes: content.length,
+        url: `${webUrl(workspaceSlug)}?surface=${surfaceSlug}`,
+      });
+      return;
+    }
+    console.log(
+      `\n  ✓ Pushed ${name} (${content.length} bytes) → ${workspaceSlug}/${surfaceSlug}\n  Pull from another machine:\n    dock pull ${name}${workspaceSlug !== "handoff" ? ` --workspace=${workspaceSlug}` : ""}\n  ${webUrl(workspaceSlug)}?surface=${surfaceSlug}\n`
+    );
+  },
+
+  /**
+   * dock pull <name> [--workspace=<slug>] [--prompt=<text>]
+   *
+   * Read the doc body of a surface previously written by `dock push`.
+   * Outputs markdown to stdout — designed to be piped into the local
+   * agent:
+   *
+   *   dock pull report.md | claude
+   *   dock pull report.md --prompt="summarize" | claude
+   *
+   * `--prompt` prefixes the doc with the prompt text + a blank line so
+   * the receiving agent reads the instruction before the content. No
+   * server-side state involved; this is purely a stdout convenience.
+   *
+   * Pull does NOT auto-create anything. If the workspace or surface
+   * doesn't exist, it errors with the canonical 404 message. Use
+   * `dock push` first.
+   */
+  async pull(args) {
+    const [name, ...rest] = args;
+    if (!name) {
+      return usageError(
+        "dock pull <name> [--workspace=<slug>] [--prompt=<text>]"
+      );
+    }
+    const { flags } = parseFlags(rest);
+    await ensureAuth();
+    const workspaceSlug = flags.workspace ? String(flags.workspace) : "handoff";
+    const surfaceSlug = slugifyForSurface(name);
+
+    const r = await api(
+      `/api/workspaces/${workspaceSlug}/doc?surface=${encodeURIComponent(surfaceSlug)}&format=markdown`
+    );
+    const md = r.markdown ?? "";
+
+    if (JSON_MODE) {
+      out({
+        workspace: workspaceSlug,
+        surface: surfaceSlug,
+        name,
+        markdown: md,
+        prompt: flags.prompt ? String(flags.prompt) : null,
+        updatedAt: r.updatedAt,
+      });
+      return;
+    }
+    if (flags.prompt) {
+      process.stdout.write(`${String(flags.prompt)}\n\n${md}\n`);
+    } else {
+      process.stdout.write(`${md}\n`);
+    }
+  },
+
   async share(args) {
     await ensureAuth();
     const slug = args[0];
@@ -2247,6 +2390,20 @@ const commands = {
     dock doc <name> [--markdown|--text]    Print the doc body
     dock doc set <name> [--file p|--stdin] Replace the body (ProseMirror JSON)
 
+  Agent-to-agent transport (scp for docs)
+    dock push <name> [--workspace=<slug>] [--from=<file>]
+                                           Drop a doc into Dock for another
+                                           agent to pull. Reads from stdin,
+                                           ./<name>, or --from=<file>. Auto-
+                                           creates the 'handoff' workspace +
+                                           a doc surface named after <name>.
+    dock pull <name> [--workspace=<slug>] [--prompt=<text>]
+                                           Read the doc body to stdout
+                                           (markdown). With --prompt, prefix
+                                           the output for piping to your
+                                           local agent:
+                                             dock pull report.md --prompt="summarize" | claude
+
   Teams (org membership)
     dock team list                         List org members + pending invites
     dock team invite [--email e] [--role member|admin] [--max-uses N] [--expires-in-days N]
@@ -2357,6 +2514,83 @@ function webUrl(slug) {
 function usageError(msg) {
   console.error(`  Usage: ${msg}`);
   process.exit(1);
+}
+
+/**
+ * kebab-slugify a free-text doc/file name for use as a Surface slug.
+ * Strips file extensions ("report.md" → "report"), normalises diacritics,
+ * lowercases, replaces non-alphanumerics with single hyphens, trims +
+ * collapses, clamps to 32 chars (matches the server's slug constraint).
+ * Mirrors `slugify()` in dock-app/src/lib/surfaces.ts so a slug picked
+ * here matches what the server would derive from the same name on
+ * `pickUniqueSurfaceSlug`.
+ */
+function slugifyForSurface(name) {
+  if (!name) return "tab";
+  return (
+    name
+      .toLowerCase()
+      .replace(/\.[a-z0-9]{1,8}$/i, "")
+      .normalize("NFKD")
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-{2,}/g, "-")
+      .slice(0, 32) || "tab"
+  );
+}
+
+/**
+ * Ensure a workspace exists at `slug`, creating it as a doc-mode
+ * workspace on first use. Used by `dock push` so the user doesn't have
+ * to think about workspace creation. Idempotent: if the workspace
+ * already exists, the GET short-circuits the create.
+ *
+ * On create we set `mode: "doc"` so the workspace's primary surface is
+ * a doc — which matches the push/pull mental model. The user's table
+ * surfaces still work, this just nudges the default-view hint.
+ */
+async function ensureHandoffWorkspace(slug) {
+  try {
+    await api(`/api/workspaces/${slug}`);
+    return;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
+  // Pretty name from the slug so the workspace lists nicely. Title-case
+  // the first word, leave the rest in kebab.
+  const name = slug
+    .split("-")
+    .map((w, i) => (i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+    .join(" ");
+  await api(`/api/workspaces`, {
+    method: "POST",
+    body: { name, mode: "doc" },
+  });
+}
+
+/**
+ * Ensure a doc Surface with `surfaceSlug` exists in `workspaceSlug`,
+ * creating it on first push. Idempotent against the same name. The
+ * surface `name` is the original free-text label the user passed (e.g.
+ * "agent_report.md"); the slug is the kebab-cased form. The server's
+ * `pickUniqueSurfaceSlug` may append a numeric suffix on collision —
+ * for our flow we GET first to short-circuit so push-of-same-name is
+ * always an update of the same surface, never a parallel "agent-report-2".
+ */
+async function ensureDocSurface(workspaceSlug, surfaceSlug, surfaceName) {
+  try {
+    await api(
+      `/api/workspaces/${workspaceSlug}/surfaces/${encodeURIComponent(surfaceSlug)}`
+    );
+    return;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
+  await api(`/api/workspaces/${workspaceSlug}/surfaces`, {
+    method: "POST",
+    body: { kind: "doc", name: surfaceName, slug: surfaceSlug },
+  });
 }
 
 // ─── Entry ─────────────────────────────────────────────────────────
