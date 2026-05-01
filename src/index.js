@@ -611,6 +611,60 @@ const commands = {
     openBrowser(url);
   },
 
+  /**
+   * dock fork <template-slug> [--open]
+   *
+   * Fork a Dock template into your active org. Wraps POST /api/remix
+   * with the canonical raw.md URL for the template:
+   *   https://trydock.ai/templates/<slug>/raw.md
+   *
+   * The remix path on the server creates a fresh workspace in the
+   * caller's active org, seeds it from the template's raw.md, and
+   * returns the new workspace's slug + URL. Same flow the web "Open
+   * in Dock" CTA goes through, just without the browser hop.
+   *
+   * Why a dedicated command rather than a generic `dock remix <url>`:
+   * templates are a first-class product surface. Saying
+   *   dock fork build-a-webapp-in-a-day
+   * reads better in scripts and chat than
+   *   dock remix https://trydock.ai/templates/build-a-webapp-in-a-day/raw.md
+   * and the failure mode (template doesn't exist) maps to a 404 on
+   * the raw.md URL, which the user can interpret cleanly.
+   *
+   * Pairs with the MCP `fork_template` tool — same shape, agent-driven.
+   */
+  async fork(args) {
+    await ensureAuth();
+    const { positional, flags } = parseFlags(args);
+    const slug = positional[0];
+    if (!slug) {
+      return usageError(
+        'dock fork <template-slug> [--open]\n  ' +
+          "e.g. dock fork build-a-webapp-in-a-day"
+      );
+    }
+    // Validate the slug shape locally so we don't make a doomed request.
+    if (!/^[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])?$/.test(slug)) {
+      return usageError(
+        "Template slug must be lowercase kebab-case (e.g. ship-a-cli-tool-to-npm)."
+      );
+    }
+    const sourceUrl = `${API_BASE}/templates/${slug}/raw.md`;
+    const r = await api("/api/remix", {
+      method: "POST",
+      body: { source: sourceUrl },
+    });
+    if (JSON_MODE) return out(r);
+    out(`\n  ✓ Forked ${slug}\n`);
+    out(`  Web:  ${r.workspace_url || webUrl(r.workspace_slug)}\n`);
+    out(`  Slug: ${r.workspace_slug}\n`);
+    if (r.org_slug) out(`  Org:  ${r.org_slug}\n`);
+    out("\n");
+    if (flags.open && r.workspace_slug) {
+      openBrowser(r.workspace_url || webUrl(r.workspace_slug));
+    }
+  },
+
   async rows(args) {
     await ensureAuth();
     const slug = args[0];
@@ -2350,6 +2404,8 @@ const commands = {
   Workspaces
     dock list                              List your workspaces
     dock new <name> [--doc]                Create a new workspace
+    dock fork <template-slug> [--open]     Fork a Dock template into your org
+                                           (see https://trydock.ai/templates)
     dock open <name>                       Open in browser
     dock rename <name> <new-name>          Rename a workspace
     dock visibility <name> <p|o|u|p>       private|org|unlisted|public
