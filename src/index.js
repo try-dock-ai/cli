@@ -2442,6 +2442,128 @@ const commands = {
     );
   },
 
+  // ─── Sheets formulas ──────────────────────────────────────────────
+  //
+  // Surface parity with REST + MCP shipped in 2026-05-14. The CLI
+  // wraps three endpoints:
+  //   GET  /api/sheets/functions             → `dock sheets functions`
+  //   POST /api/sheets/validate-formula      → `dock sheets validate`
+  //   POST /api/sheets/evaluate-formula      → `dock sheets eval`
+  //
+  // Public endpoints (catalog + validate + standalone evaluate) work
+  // without auth; in-workspace evaluate uses the active session.
+  async sheets(args) {
+    const [sub, ...rest] = args;
+
+    if (!sub || sub === "help") {
+      return usageError(
+        "dock sheets <functions|validate|eval>  (see 'dock help' for details)"
+      );
+    }
+
+    if (sub === "functions" || sub === "fns" || sub === "list-functions") {
+      // dock sheets functions [--category C] [--slice v1] [--name n]
+      // List the formula function catalog. Public — no auth.
+      const { flags } = parseFlags(rest);
+      const qs = new URLSearchParams();
+      if (flags.category) qs.set("category", String(flags.category));
+      if (flags.slice) qs.set("slice", String(flags.slice));
+      if (flags.name) qs.set("name", String(flags.name));
+      const path =
+        "/api/sheets/functions" + (qs.toString() ? `?${qs}` : "");
+      const r = await api(path);
+      if (JSON_MODE) return out(r);
+      out(`\n  ${r.count} function${r.count === 1 ? "" : "s"}\n\n`);
+      for (const fn of r.functions) {
+        const head = `${fn.name}${fn.signature || ""}`;
+        const tag = `[${fn.category} · ${fn.slice}]`;
+        out(`  ${head.padEnd(36)} ${tag}\n`);
+        if (fn.description) out(`    ${fn.description}\n`);
+        if (fn.examples && fn.examples[0]) {
+          out(
+            `    ${fn.examples[0].formula} → ${fn.examples[0].result}\n`
+          );
+        }
+        out("\n");
+      }
+      return;
+    }
+
+    if (sub === "validate" || sub === "check") {
+      // dock sheets validate '=SUMIF(B2:B10, ">0")'
+      // Parse-check a formula. Public — no auth needed.
+      const formula = rest[0];
+      if (!formula) {
+        return usageError(
+          'dock sheets validate "<formula>"  (formula must start with =)'
+        );
+      }
+      const r = await api("/api/sheets/validate-formula", {
+        method: "POST",
+        body: { formula },
+      });
+      if (JSON_MODE) return out(r);
+      if (r.ok) {
+        out(`\n  ✓ Valid\n`);
+      } else {
+        out(`\n  ✗ ${r.error}\n`);
+      }
+      if (r.referencedFunctions && r.referencedFunctions.length > 0) {
+        out(`  Referenced: ${r.referencedFunctions.join(", ")}\n`);
+      }
+      if (r.unknownFunctions && r.unknownFunctions.length > 0) {
+        out(`  Unknown:    ${r.unknownFunctions.join(", ")}\n`);
+      }
+      out("\n");
+      return;
+    }
+
+    if (sub === "eval" || sub === "evaluate") {
+      // dock sheets eval '=SUM(1, 2, 3)' [--workspace <slug>]
+      //                                  [--at <rowId>:<colKey>]
+      // Two modes: standalone (no workspace) is public; in-workspace
+      // uses the session.
+      const formula = rest[0];
+      if (!formula) {
+        return usageError(
+          'dock sheets eval "<formula>" [--workspace <slug>] [--at rowId:colKey]'
+        );
+      }
+      const { flags } = parseFlags(rest.slice(1));
+      const body = { formula };
+      if (flags.workspace || flags.ws) {
+        body.workspaceSlug = String(flags.workspace || flags.ws);
+        if (flags.at) {
+          const at = String(flags.at);
+          const sep = at.indexOf(":");
+          if (sep <= 0) {
+            return usageError(
+              "--at must be <rowId>:<colKey> (the row id and the column key joined by a colon)"
+            );
+          }
+          body.at = { rowId: at.slice(0, sep), colKey: at.slice(sep + 1) };
+        }
+        // In-workspace mode requires auth.
+        await ensureAuth();
+      }
+      const r = await api("/api/sheets/evaluate-formula", {
+        method: "POST",
+        body,
+      });
+      if (JSON_MODE) return out(r);
+      if (r.ok) {
+        out(`\n  ${r.displayValue}\n\n`);
+      } else {
+        out(`\n  ✗ ${r.error?.code || "ERROR"}: ${r.error?.summary || "evaluation failed"}\n\n`);
+      }
+      return;
+    }
+
+    return usageError(
+      "dock sheets <functions|validate|eval>  (see 'dock help' for details)"
+    );
+  },
+
   async help() {
     console.log(`
   dock — open shared workspaces with your agents in seconds
@@ -2596,6 +2718,19 @@ const commands = {
   Referrals
     dock referrals                         Your code, progress, months earned
     dock referrals link                    Print your shareable invite URL
+
+  Sheets formulas
+    dock sheets functions [--category C] [--slice v1|v2|v3|v4] [--name n]
+                                           List the formula function catalog
+                                           (39 functions: SUM, COUNT, IF,
+                                           VLOOKUP, …). Public, no auth.
+    dock sheets validate "<formula>"        Parse-check a formula. Reports
+                                           referenced + unknown function names.
+    dock sheets eval "<formula>" [--workspace <slug>] [--at <rowId>:<colKey>]
+                                           Evaluate. Standalone (public) when
+                                           --workspace is omitted; otherwise
+                                           evaluates against the workspace's
+                                           rows + columns (requires auth).
 
   Data
     dock export [--out FILE]               Full GDPR JSON export
