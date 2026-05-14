@@ -631,22 +631,46 @@ const commands = {
 
   async add(args) {
     await ensureAuth();
-    const slug = args[0];
-    if (!slug) return usageError("dock add <workspace> key=value [key=value...]");
+    const { positional, flags } = parseFlags(args);
+    const slug = positional[0];
+    if (!slug)
+      return usageError(
+        "dock add <workspace> key=value [key=value...] [--surface=<slug>] [--auto-create-columns]"
+      );
     const data = {};
-    for (const kv of args.slice(1)) {
+    for (const kv of positional.slice(1)) {
       const idx = kv.indexOf("=");
       if (idx <= 0) continue;
       data[kv.slice(0, idx)] = kv.slice(idx + 1);
     }
     if (Object.keys(data).length === 0) {
-      return usageError("dock add <workspace> key=value [key=value...]");
+      return usageError(
+        "dock add <workspace> key=value [key=value...] [--surface=<slug>] [--auto-create-columns]"
+      );
     }
+    const body = { data };
+    if (flags.surface) body.surface = String(flags.surface);
+    // `--auto-create-columns` opt-in (Mike F2 / support#103). Default
+    // false on the server. When passed, the server appends `text`
+    // columns for every key in `data` that doesn't already exist on
+    // the target surface. The response then carries `created_columns`
+    // (and any keys NOT auto-promoted surface as `unmapped_fields`).
+    if (flags["auto-create-columns"]) body.auto_create_columns = true;
     const row = await api(`/api/workspaces/${slug}/rows`, {
       method: "POST",
-      body: { data },
+      body,
     });
-    console.log(`\n  ✓ Added row ${row.id} at position ${row.position}\n`);
+    if (JSON_MODE) return out(row);
+    console.log(`\n  ✓ Added row ${row.id} at position ${row.position}`);
+    if (Array.isArray(row.created_columns) && row.created_columns.length) {
+      console.log(
+        `  ✚ Auto-created ${row.created_columns.length} column${row.created_columns.length === 1 ? "" : "s"}: ${row.created_columns.join(", ")}`
+      );
+    }
+    if (row.warning) {
+      console.log(`  ⚠ ${row.warning}`);
+    }
+    console.log();
   },
 
   /**
@@ -1748,9 +1772,101 @@ const commands = {
         out(`\n  ✓ Archived ${surfSlug}\n\n`);
         return;
       }
+      /**
+       * dock surface set-columns <workspace> <surface-slug> [--from <file>] [--json '<array>']
+       *
+       * Wholesale replacement of a table surface's column schema
+       * (Mike F1 — PR #3008 brought this to the REST PATCH
+       * /surfaces/:slug endpoint). Doc/html surfaces reject 400 with
+       * a table-only error. Existing row.data keys not covered by
+       * the new column set are PRESERVED on disk; they just stop
+       * rendering in the UI until a column with that key is added
+       * back. Mirrors the safe-by-default semantics of every other
+       * column-level write.
+       *
+       * Column shape (one entry per column):
+       *   { key, label, type, position, width?, hidden?, description?, options? }
+       *
+       * type ∈ text | longtext | url | status | owner | date | number
+       * options required on status/owner — each entry needs
+       * `{ value, label, color? }`.
+       *
+       * Three input flavors:
+       *   dock surface set-columns ws surf --from cols.json
+       *   cat cols.json | dock surface set-columns ws surf
+       *   dock surface set-columns ws surf --json '[...]'
+       */
+      case "set-columns":
+      case "columns": {
+        const wsName = rest[0];
+        const surfSlug = rest[1];
+        if (!wsName || !surfSlug) {
+          return usageError(
+            "dock surface set-columns <workspace> <surface-slug> [--from <path>] [--json '<array>']"
+          );
+        }
+        const { flags } = parseFlags(rest.slice(2));
+        let columns;
+        if (flags.from) {
+          try {
+            columns = JSON.parse(readFileSync(String(flags.from), "utf-8"));
+          } catch (e) {
+            throw new Error(
+              `Couldn't read --from=${flags.from} as JSON: ${e.message ?? e}`
+            );
+          }
+        } else if (flags.json && typeof flags.json === "string") {
+          try {
+            columns = JSON.parse(flags.json);
+          } catch (e) {
+            throw new Error(`Invalid --json payload: ${e.message ?? e}`);
+          }
+        } else if (!process.stdin.isTTY) {
+          const raw = await readStdin();
+          if (!raw || !raw.trim()) {
+            return usageError(
+              "No columns payload. Pipe a JSON array via stdin or pass --from <file>."
+            );
+          }
+          try {
+            columns = JSON.parse(raw);
+          } catch (e) {
+            throw new Error(`Couldn't parse stdin as JSON: ${e.message ?? e}`);
+          }
+        } else {
+          return usageError(
+            "dock surface set-columns <workspace> <surface-slug> [--from <path>] [--json '<array>']"
+          );
+        }
+        if (!Array.isArray(columns)) {
+          throw new Error(
+            "columns payload must be a JSON array of ColumnDef objects"
+          );
+        }
+        const r = await api(
+          `/api/workspaces/${wsName}/surfaces/${surfSlug}`,
+          { method: "PATCH", body: { columns } }
+        );
+        if (JSON_MODE) return out(r);
+        const nextCols = Array.isArray(r.surface?.columns)
+          ? r.surface.columns
+          : [];
+        out(
+          `\n  ✓ Replaced columns on ${r.surface.slug} — ${nextCols.length} column${nextCols.length === 1 ? "" : "s"}\n`
+        );
+        if (nextCols.length) {
+          for (const c of nextCols) {
+            out(
+              `    · ${c.key.padEnd(20)} ${String(c.type ?? "text").padEnd(10)} ${c.label ?? ""}\n`
+            );
+          }
+        }
+        out("\n");
+        return;
+      }
       default:
         return usageError(
-          "dock surface <list|new|rename|reorder|rm> <workspace> [args]"
+          "dock surface <list|new|rename|reorder|set-columns|rm> <workspace> [args]"
         );
     }
   },
@@ -2367,11 +2483,12 @@ const commands = {
     dock surface new <name> <surface-name> [--doc] [--slug <s>]
     dock surface rename <name> <surface-slug> <new-name>
     dock surface reorder <name> <surface-slug> <position>
+    dock surface set-columns <name> <surface-slug> [--from cols.json | --json '<array>' | <stdin>]
     dock surface rm <name> <surface-slug>
 
   Rows
     dock rows <name>                       List rows
-    dock add <name> key=value ...          Append a row
+    dock add <name> key=value ... [--surface=<slug>] [--auto-create-columns]
     dock get <name> <row-id>               Print row data
     dock set <name> <row-id> key=val ...   Update fields
     dock bulk update <name> [--file p|--stdin]   Batch update (PATCH /rows/bulk)
