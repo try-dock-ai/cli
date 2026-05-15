@@ -589,9 +589,30 @@ const commands = {
 
   async new(args) {
     await ensureAuth();
-    const name = args[0];
-    if (!name) return usageError("dock new <name> [--doc]");
-    const mode = args.includes("--doc") ? "doc" : "table";
+    const positional = args.filter((a) => !a.startsWith("--"));
+    const name = positional[0];
+    if (!name)
+      return usageError(
+        "dock new <name> [--doc | --table | --html]\n" +
+          "    --doc    Create a doc-mode workspace (TipTap rich-text body)\n" +
+          "    --table  Create a table-mode workspace (typed rows + columns) [default]\n" +
+          "    --html   Create an html-mode workspace (sandboxed mockup surface)",
+      );
+    // Resolve mode from the flag set. Conflicting flags fail loudly
+    // so the caller doesn't get a surprising workspace shape. Default
+    // stays `table` (Mike requested defaulting to doc but flipping
+    // the default would break every existing script that types
+    // `dock new <name>` expecting a sheet — symmetric flags + clear
+    // discovery hit the same goal without the regression risk).
+    const wantDoc = args.includes("--doc");
+    const wantTable = args.includes("--table");
+    const wantHtml = args.includes("--html");
+    if ([wantDoc, wantTable, wantHtml].filter(Boolean).length > 1) {
+      return usageError(
+        "Pass at most one of --doc / --table / --html. Defaults to --table.",
+      );
+    }
+    const mode = wantDoc ? "doc" : wantHtml ? "html" : "table";
     const res = await api("/api/workspaces", {
       method: "POST",
       body: { name, mode },
@@ -2465,7 +2486,9 @@ const commands = {
 
   Workspaces
     dock list                              List your workspaces
-    dock new <name> [--doc]                Create a new workspace
+    dock new <name> [--doc | --table | --html]
+                                           Create a new workspace
+                                           (default: --table)
     dock open <name>                       Open in browser
     dock rename <name> <new-name>          Rename a workspace
     dock visibility <name> <p|o|u|p>       private|org|unlisted|public
