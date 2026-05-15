@@ -129,13 +129,63 @@ const MCP_CLIENTS = {
   },
 };
 
+/**
+ * Canonical config path: `~/.dock/config.json` with field
+ * `accessToken`. Anything else is a deprecated shape — read it
+ * as a fallback and emit a one-line stderr hint pointing at the
+ * canonical location.
+ *
+ * Why the fallback exists: cueapi (and any agent onboarding doc
+ * that reflexes to XDG conventions) historically pointed agents
+ * at `~/.config/dock/credentials.json` with field `api_key`. Both
+ * are wrong, but until those callers update, silently accepting
+ * the deprecated shape removes the 401-on-first-call friction.
+ * Surfaced 2026-05-14 by cueapi-three (support#104).
+ */
+const DEPRECATED_CONFIG_PATH = join(
+  homedir(),
+  ".config",
+  "dock",
+  "credentials.json",
+);
+let deprecatedHintEmitted = false;
+
 function readConfig() {
-  if (!existsSync(CONFIG_FILE)) return {};
-  try {
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
-  } catch {
-    return {};
+  // Canonical file wins.
+  if (existsSync(CONFIG_FILE)) {
+    try {
+      return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+    } catch {
+      return {};
+    }
   }
+  // Fallback: deprecated cueapi-style file. Translate `api_key` →
+  // `accessToken` so the rest of the CLI doesn't have to know
+  // about the legacy shape. One-shot stderr hint so the operator
+  // sees the deprecation without it spamming every command.
+  if (existsSync(DEPRECATED_CONFIG_PATH)) {
+    try {
+      const raw = JSON.parse(readFileSync(DEPRECATED_CONFIG_PATH, "utf-8"));
+      const token =
+        typeof raw.api_key === "string" && raw.api_key
+          ? raw.api_key
+          : typeof raw.accessToken === "string" && raw.accessToken
+            ? raw.accessToken
+            : null;
+      if (token && !deprecatedHintEmitted) {
+        deprecatedHintEmitted = true;
+        process.stderr.write(
+          "  dock: reading legacy ~/.config/dock/credentials.json. " +
+            "Migrate to ~/.dock/config.json (field `accessToken`) " +
+            "via `dock login` to silence this hint.\n",
+        );
+      }
+      return token ? { accessToken: token } : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }
 
 function writeConfig(cfg) {
