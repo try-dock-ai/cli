@@ -1398,32 +1398,91 @@ const commands = {
 
   // ─── Doc body ──────────────────────────────────────────────────
 
-  // Read or write the rich-text doc body. Write reads ProseMirror JSON
-  // from --file or stdin; the server validates shape via doc-guard
-  // before writing. Last-write-wins (no CRDT yet).
+  // Read or write the rich-text doc body. Write accepts EITHER
+  // markdown (CommonMark + GFM + Dock's rich-format extensions) OR
+  // ProseMirror JSON from --file or stdin; the server converts
+  // markdown via remark and validates shape via doc-guard before
+  // writing. Last-write-wins (no CRDT yet).
   //
-  //   dock doc <workspace>                     read JSON
-  //   dock doc <workspace> --markdown          read as markdown
-  //   dock doc <workspace> --text              read as plain text
-  //   dock doc set <workspace> --file body.json
-  //   cat body.json | dock doc set <workspace>
+  //   dock doc <workspace> [--surface <slug>]      read JSON
+  //   dock doc <workspace> --markdown              read as markdown
+  //   dock doc <workspace> --text                  read as plain text
+  //
+  //   dock doc set <workspace> --file body.md      write markdown
+  //   dock doc set <workspace> --file body.json    write ProseMirror JSON
+  //   echo "# Hello" | dock doc set <workspace>    write markdown via stdin
+  //   cat body.json | dock doc set <workspace>     write JSON via stdin
+  //
+  // Input shape is auto-detected: if the body parses as JSON AND the
+  // parsed shape looks like ProseMirror (`{type: "doc"}` or
+  // `{content: [...]}`), it's sent as `{content}`. Otherwise it's
+  // sent as `{markdown}`. This matches the REST endpoint, which has
+  // accepted both shapes since the doc ergonomics PR (2026-04-25)
+  // and closes support#93 (stdin appeared to corrupt PM — actually
+  // the CLI was JSON.parsing arbitrary markdown and dying silently),
+  // support#101 (CLI required PM JSON, REST accepted markdown), and
+  // support#95 (no --surface flag on multi-doc workspaces).
   async doc(args) {
     await ensureAuth();
     if (args[0] === "set" || args[0] === "write" || args[0] === "update") {
       const slug = args[1];
-      if (!slug) return usageError("dock doc set <workspace> [--file path]");
+      if (!slug)
+        return usageError(
+          "dock doc set <workspace> [--file path] [--surface <slug>] [--markdown]",
+        );
       const { flags } = parseFlags(args.slice(2));
-      let payload;
+      let raw;
       if (flags.file) {
-        payload = JSON.parse(readFileSync(String(flags.file), "utf-8"));
+        try {
+          raw = readFileSync(String(flags.file), "utf-8");
+        } catch (err) {
+          throw new Error(
+            `Couldn't read --file=${flags.file}: ${err.message ?? err}`,
+          );
+        }
       } else {
-        const raw = await readStdin();
-        if (!raw) return usageError("dock doc set <workspace> [--file path]");
-        payload = JSON.parse(raw);
+        raw = await readStdin();
+        if (!raw)
+          return usageError(
+            "dock doc set <workspace> [--file path] [--surface <slug>] [--markdown]",
+          );
       }
-      // Accept either a bare ProseMirror doc or `{ content: ... }`.
-      const body = payload && payload.content ? payload : { content: payload };
-      const r = await api(`/api/workspaces/${slug}/doc`, {
+      // Shape detection: explicit --markdown wins; otherwise try
+      // JSON.parse and check if it looks like ProseMirror; otherwise
+      // treat as markdown. `flags.json` is the explicit opt-out for
+      // edge cases where the user knows the input is JSON but it
+      // doesn't pass the heuristic (rare).
+      const explicitMarkdown = flags.markdown === true;
+      const explicitJson = flags.json === true && !explicitMarkdown;
+      let body;
+      if (explicitMarkdown) {
+        body = { markdown: raw };
+      } else {
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+        const looksLikeProseMirror =
+          parsed &&
+          typeof parsed === "object" &&
+          (parsed.type === "doc" ||
+            (Array.isArray(parsed.content) && !explicitMarkdown));
+        if (parsed && (looksLikeProseMirror || explicitJson)) {
+          body = parsed.content ? parsed : { content: parsed };
+        } else {
+          body = { markdown: raw };
+        }
+      }
+      // --surface routes the write to a specific doc tab on multi-
+      // surface workspaces. Without it, the server rejects with a
+      // helpful "pass ?surface_slug=..." error rather than silently
+      // writing the primary doc (support#95).
+      const qs = flags.surface
+        ? `?surface=${encodeURIComponent(String(flags.surface))}`
+        : "";
+      const r = await api(`/api/workspaces/${slug}/doc${qs}`, {
         method: "PUT",
         body,
       });
@@ -1431,12 +1490,17 @@ const commands = {
       return;
     }
     const [slug] = args;
-    if (!slug) return usageError("dock doc <workspace> [set] [--markdown|--text]");
+    if (!slug)
+      return usageError(
+        "dock doc <workspace> [--markdown|--text] [--surface <slug>]",
+      );
     const { flags } = parseFlags(args.slice(1));
-    let qs = "";
-    if (flags.markdown) qs = "?format=markdown";
-    else if (flags.text) qs = "?format=text";
-    const r = await api(`/api/workspaces/${slug}/doc${qs}`);
+    const params = new URLSearchParams();
+    if (flags.markdown) params.set("format", "markdown");
+    else if (flags.text) params.set("format", "text");
+    if (flags.surface) params.set("surface", String(flags.surface));
+    const qs = params.toString();
+    const r = await api(`/api/workspaces/${slug}/doc${qs ? `?${qs}` : ""}`);
     if (JSON_MODE) return out(r);
     if (flags.markdown) out(r.markdown + "\n");
     else if (flags.text) out(r.text + "\n");
@@ -2577,8 +2641,14 @@ const commands = {
     dock column rm <name> <key>            Drop a column (cell data lost)
 
   Docs (rich-text body — every workspace has one)
-    dock doc <name> [--markdown|--text]    Print the doc body
-    dock doc set <name> [--file p|--stdin] Replace the body (ProseMirror JSON)
+    dock doc <name> [--markdown|--text] [--surface <slug>]
+                                           Print the doc body
+    dock doc set <name> [--file p|--stdin] [--surface <slug>] [--markdown]
+                                           Replace the body. Accepts markdown
+                                           (CommonMark + GFM + Dock formats)
+                                           or ProseMirror JSON. Shape is
+                                           auto-detected unless --markdown
+                                           is passed explicitly.
 
   Agent-to-agent transport (scp for docs)
     dock push <name> [--workspace=<slug>] [--from=<file>]
