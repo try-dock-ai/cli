@@ -130,17 +130,28 @@ const MCP_CLIENTS = {
 };
 
 /**
- * Canonical config path: `~/.dock/config.json` with field
- * `accessToken`. Anything else is a deprecated shape — read it
- * as a fallback and emit a one-line stderr hint pointing at the
- * canonical location.
+ * Auth sources, in priority order:
  *
- * Why the fallback exists: cueapi (and any agent onboarding doc
- * that reflexes to XDG conventions) historically pointed agents
- * at `~/.config/dock/credentials.json` with field `api_key`. Both
- * are wrong, but until those callers update, silently accepting
- * the deprecated shape removes the 401-on-first-call friction.
- * Surfaced 2026-05-14 by cueapi-three (support#104).
+ *   1. `DOCK_API_KEY` env var. Agent-shaped: the harness injects the
+ *      key as an env var and the CLI is stateless. No file ever
+ *      touches disk. The bootstrap doc instructs agents to set
+ *      this; pre-2026-05-16 the CLI silently ignored it for auth
+ *      (support#116, filed by Ved). It's now the highest-priority
+ *      source so a freshly-bootstrapped agent's `dock whoami`
+ *      works on the first try.
+ *
+ *   2. `~/.dock/config.json` with field `accessToken`. The
+ *      canonical persisted-credential path. Written by `dock login`
+ *      (OAuth/PKCE access token) and by manual setup (dk_* agent
+ *      API key for the workaround period). Both shapes are bearer
+ *      tokens on the server so they work identically.
+ *
+ *   3. Deprecated `~/.config/dock/credentials.json` with field
+ *      `api_key`. cueapi (and any agent onboarding doc that
+ *      reflexes to XDG conventions) historically pointed agents
+ *      here. Translated transparently with a one-shot stderr hint
+ *      so the operator notices the deprecation. Surfaced
+ *      2026-05-14 by cueapi-three (support#104).
  */
 const DEPRECATED_CONFIG_PATH = join(
   homedir(),
@@ -151,7 +162,14 @@ const DEPRECATED_CONFIG_PATH = join(
 let deprecatedHintEmitted = false;
 
 function readConfig() {
-  // Canonical file wins.
+  // Env var wins. Stateless agent path — no on-disk credential
+  // needed, which is what the bootstrap doc has been telling
+  // agents to use since 2026-05.
+  const envKey = process.env.DOCK_API_KEY;
+  if (typeof envKey === "string" && envKey.trim()) {
+    return { accessToken: envKey.trim(), fromEnv: true };
+  }
+  // Canonical file second.
   if (existsSync(CONFIG_FILE)) {
     try {
       return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
@@ -600,7 +618,19 @@ const commands = {
   async whoami() {
     const cfg = readConfig();
     if (!cfg.accessToken) {
-      console.log("  Not signed in. Run `dock login`.\n");
+      // Two distinct unauthenticated cases. Steer agents and humans
+      // down the right path instead of blanket-recommending
+      // `dock login` (which opens an OAuth browser and clobbers any
+      // agent identity that was meant to load from DOCK_API_KEY).
+      // Surfaced 2026-05-16 by Ved (support#119).
+      console.log(
+        "\n  Not signed in.\n" +
+          "\n" +
+          "  Agents: set DOCK_API_KEY=dk_... in your env, then re-run.\n" +
+          "  Humans: run `dock login` to start the browser OAuth flow.\n" +
+          "\n" +
+          "  Docs: https://trydock.ai/docs/agent-prompt\n",
+      );
       return;
     }
     const me = await api("/api/me");
@@ -2169,9 +2199,18 @@ const commands = {
     if (JSON_MODE) {
       return out({ ok: true, client, path, configured: true });
     }
+    // The session-restart line is the most-overlooked step in the
+    // setup flow — a fresh agent runs `mcp install`, immediately
+    // tries an MCP tool, and hits silent nothing because the MCP
+    // server isn't loaded until the next session. Surfaced
+    // 2026-05-16 by Ved (support#123). Emphasised below so it
+    // doesn't read as a footnote.
     out(
       `\n  ✓ Wrote MCP config for ${client} → ${path}\n` +
-        `  Restart your agent. Dock's tools (8) will appear in the next session.\n\n`
+        `\n` +
+        `  ⚠ Restart your agent before using MCP tools.\n` +
+        `    The MCP server only loads on the next session start.\n` +
+        `    Tools won't appear in the current session.\n\n`
     );
   },
 
@@ -2869,7 +2908,22 @@ const filtered = rawArgs.filter((a) => {
 
 const [command, ...args] = filtered;
 
-if (!command || command === "help" || command === "--help" || command === "-h") {
+// `--help` / `-h` is read-only on every subcommand. Pre-2026-05-16
+// the dispatcher only honored these at the TOP level, so
+// `dock login --help` would run the OAuth login flow and clobber
+// ~/.dock/config.json — a destructive side effect for what should
+// be flag-discovery. Surfaced by PRW agent (support#115). Now any
+// command invoked with --help short-circuits to the global usage
+// text before the side-effecting handler runs.
+const wantsHelp =
+  !command ||
+  command === "help" ||
+  command === "--help" ||
+  command === "-h" ||
+  args.includes("--help") ||
+  args.includes("-h");
+
+if (wantsHelp) {
   commands.help();
 } else if (commands[command]) {
   commands[command](args).catch((err) => {
