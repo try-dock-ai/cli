@@ -1,6 +1,6 @@
 {
   "name": "@trydock/cli",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Spin up shared workspaces for humans and AI agents from your terminal.",
   "bin": {
     "dock": "src/index.js"
