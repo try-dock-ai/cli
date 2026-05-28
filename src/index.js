@@ -1808,6 +1808,183 @@ const commands = {
     }
   },
 
+  // ─── Files (Files surface, gated) ─────────────────────────────
+
+  async files(args) {
+    const sub = args[0];
+    const rest = args.slice(1);
+    if (!sub) {
+      return usageError(
+        "dock files <list|recent|share|unshare|rename|move|set-meta|zip> <workspace> [args]\n" +
+          "    list <ws> --surface=<slug> [--parent=<folderId>]\n" +
+          "    recent <ws> --surface=<slug>                       # 50 most-recently-updated\n" +
+          "    share <ws> --id=<fileId>                            # mint public URL\n" +
+          "    unshare <ws> --id=<fileId> --token=<tokenId>        # revoke a share token\n" +
+          "    rename <ws> --id=<fileId> --name=<new>              # needs Slice 1\n" +
+          "    move <ws> --id=<fileId> --to=<folderId|root>        # needs Slice 1\n" +
+          "    set-meta <ws> --id=<fileId> [--star|--unstar] [--tags=a,b] [--description=...]  # needs Slice 5\n" +
+          "    zip <ws> --surface=<slug> --ids=<a,b,c> --out=<file.zip>",
+      );
+    }
+    await ensureAuth();
+    const slug = rest[0];
+    if (!slug && !["recent"].includes(sub)) {
+      return usageError(`dock files ${sub} <workspace> [args]`);
+    }
+    const { flags } = parseFlags(rest.slice(1));
+
+    switch (sub) {
+      case "list": {
+        if (!flags.surface) return usageError("dock files list <ws> --surface=<slug>");
+        const params = new URLSearchParams({
+          surfaceSlug: String(flags.surface),
+        });
+        if (flags.parent) params.set("parentFolderId", String(flags.parent));
+        const r = await api(`/api/workspaces/${slug}/files?${params}`);
+        if (JSON_MODE) return out(r);
+        const folders = r.folders ?? [];
+        const files = r.files ?? [];
+        if (!folders.length && !files.length) {
+          out("\n  Empty surface.\n");
+          return;
+        }
+        out("\n");
+        for (const f of folders) out(`  📁  ${f.name}  ${f.id}\n`);
+        for (const f of files) {
+          const size = f.size ? `${(f.size / 1024).toFixed(1)}K` : "";
+          out(`  📄  ${f.name.padEnd(36)}  ${size.padEnd(8)} ${f.id}\n`);
+        }
+        out("\n");
+        return;
+      }
+      case "recent": {
+        if (!flags.surface) return usageError("dock files recent <ws> --surface=<slug>");
+        const params = new URLSearchParams({
+          surfaceSlug: String(flags.surface),
+          view: "recent",
+        });
+        const r = await api(`/api/workspaces/${slug}/files?${params}`);
+        if (JSON_MODE) return out(r);
+        const files = r.files ?? [];
+        if (!files.length) {
+          out("\n  No files yet on this surface.\n");
+          return;
+        }
+        out("\n");
+        for (const f of files) {
+          const when = new Date(f.updatedAt).toISOString().slice(0, 16).replace("T", " ");
+          out(`  ${when}  ${f.name.padEnd(36)}  ${f.id}\n`);
+        }
+        out("\n");
+        return;
+      }
+      case "share": {
+        if (!flags.id) return usageError("dock files share <ws> --id=<fileId>");
+        const r = await api(`/api/workspaces/${slug}/files/${flags.id}/share`, {
+          method: "POST",
+        });
+        if (JSON_MODE) return out(r);
+        out(`\n  ✓ Share URL (anyone can open):\n  ${r.url}\n\n  Token id: ${r.id}\n\n`);
+        return;
+      }
+      case "unshare": {
+        if (!flags.id || !flags.token) {
+          return usageError("dock files unshare <ws> --id=<fileId> --token=<tokenId>");
+        }
+        const r = await api(
+          `/api/workspaces/${slug}/files/${flags.id}/share?tokenId=${encodeURIComponent(String(flags.token))}`,
+          { method: "DELETE" },
+        );
+        out(`\n  ✓ ${r.alreadyRevoked ? "Already revoked" : "Revoked"}\n\n`, r);
+        return;
+      }
+      case "rename": {
+        if (!flags.id || !flags.name) {
+          return usageError("dock files rename <ws> --id=<fileId> --name=<new>");
+        }
+        const r = await api(`/api/workspaces/${slug}/files/${flags.id}`, {
+          method: "PATCH",
+          body: { name: String(flags.name) },
+        });
+        out(`\n  ✓ Renamed to ${flags.name}\n\n`, r);
+        return;
+      }
+      case "move": {
+        if (!flags.id || !flags.to) {
+          return usageError(
+            "dock files move <ws> --id=<fileId> --to=<folderId|root>",
+          );
+        }
+        const parent = String(flags.to) === "root" ? null : String(flags.to);
+        const r = await api(`/api/workspaces/${slug}/files/${flags.id}`, {
+          method: "PATCH",
+          body: { parentFolderId: parent },
+        });
+        out(`\n  ✓ Moved\n\n`, r);
+        return;
+      }
+      case "set-meta": {
+        if (!flags.id) return usageError("dock files set-meta <ws> --id=<fileId> [...]");
+        const body = {};
+        if (flags.star) body.starred = true;
+        if (flags.unstar) body.starred = false;
+        if (flags.tags != null) {
+          body.tags = String(flags.tags).split(",").map((t) => t.trim()).filter(Boolean);
+        }
+        if (flags.description != null) {
+          body.description = String(flags.description) || null;
+        }
+        if (Object.keys(body).length === 0) {
+          return usageError(
+            "Pass at least one of: --star, --unstar, --tags=a,b, --description=...",
+          );
+        }
+        const r = await api(`/api/workspaces/${slug}/files/${flags.id}/metadata`, {
+          method: "PATCH",
+          body,
+        });
+        out(`\n  ✓ Metadata updated\n\n`, r);
+        return;
+      }
+      case "zip": {
+        if (!flags.surface || !flags.ids || !flags.out) {
+          return usageError(
+            "dock files zip <ws> --surface=<slug> --ids=a,b,c --out=<file.zip>",
+          );
+        }
+        const fileIds = String(flags.ids).split(",").map((s) => s.trim()).filter(Boolean);
+        const tok = readConfig().accessToken;
+        const r = await fetch(`${API_BASE}/api/workspaces/${slug}/files/zip`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${tok}`,
+          },
+          body: JSON.stringify({
+            fileIds,
+            surfaceSlug: String(flags.surface),
+          }),
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(`zip failed: ${r.status} ${t.slice(0, 200)}`);
+        }
+        const ab = await r.arrayBuffer();
+        writeFileSync(String(flags.out), Buffer.from(ab));
+        out(
+          `\n  ✓ Wrote ${(ab.byteLength / 1024).toFixed(1)} KB to ${flags.out}\n\n`,
+          { file: String(flags.out), bytes: ab.byteLength },
+        );
+        return;
+      }
+      default:
+        return usageError(
+          `Unknown subcommand: ${sub}\n` +
+            "  Valid: list, recent, share, unshare, rename, move, set-meta, zip",
+        );
+    }
+  },
+
   // ─── Surfaces (tabs inside a workspace) ────────────────────────
 
   async surface(args) {
