@@ -1145,7 +1145,7 @@ const commands = {
       const [commentId] = args.slice(1);
       if (!commentId) return usageError("dock comment thread <comment-id>");
       await ensureAuth();
-      const data = await api(`/api/comments/${commentId}`);
+      const data = await api(`/api/comments/${encodeURIComponent(commentId)}`);
       if (JSON_MODE) return out(data);
       const c = data.comment ?? data;
       const replies = data.replies ?? [];
@@ -1173,13 +1173,13 @@ const commands = {
       const body = rest.join(" ").trim();
       if (!body) return usageError("dock comment reply <comment-id> <body>");
       await ensureAuth();
-      const parent = await api(`/api/comments/${commentId}`);
+      const parent = await api(`/api/comments/${encodeURIComponent(commentId)}`);
       const p = parent.comment ?? parent;
       const slug = p.workspaceSlug || p.workspace?.slug;
       if (!slug) {
         throw new Error(`Could not resolve workspace slug from parent comment ${commentId}`);
       }
-      const r = await api(`/api/workspaces/${slug}/comments`, {
+      const r = await api(`/api/workspaces/${encodeURIComponent(slug)}/comments`, {
         method: "POST",
         body: {
           target: { type: p.targetType, id: p.targetId },
@@ -1201,13 +1201,13 @@ const commands = {
       await ensureAuth();
       if (action === "remove") {
         const r = await api(
-          `/api/comments/${commentId}/reactions/${encodeURIComponent(emoji)}`,
+          `/api/comments/${encodeURIComponent(commentId)}/reactions/${encodeURIComponent(emoji)}`,
           { method: "DELETE" }
         );
         out(`\n  ✓ Reaction removed (${emoji})\n`, r);
         return;
       }
-      const r = await api(`/api/comments/${commentId}/reactions`, {
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/reactions`, {
         method: "POST",
         body: { emoji },
       });
@@ -1218,7 +1218,7 @@ const commands = {
       const [commentId] = args.slice(1);
       if (!commentId) return usageError("dock comment resolve <comment-id>");
       await ensureAuth();
-      const r = await api(`/api/comments/${commentId}/resolve`, { method: "PATCH" });
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/resolve`, { method: "PATCH" });
       out(`\n  ✓ Thread resolved\n`, r);
       return;
     }
@@ -1226,7 +1226,7 @@ const commands = {
       const [commentId] = args.slice(1);
       if (!commentId) return usageError("dock comment unresolve <comment-id>");
       await ensureAuth();
-      const r = await api(`/api/comments/${commentId}/unresolve`, { method: "PATCH" });
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/unresolve`, { method: "PATCH" });
       out(`\n  ✓ Thread re-opened\n`, r);
       return;
     }
