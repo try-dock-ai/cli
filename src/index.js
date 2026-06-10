@@ -1083,15 +1083,35 @@ const commands = {
     out(`\n  ✓ Updated ${r.updated} row(s)\n`, r);
   },
 
-  // Row comments. `dock comment <list|add> <workspace> <row-id> [body]`.
+  // Row and thread comments.
+  //
+  // Workspace-scoped sub-commands (legacy, row addressing):
+  //   dock comment list <workspace> <row-id>
+  //   dock comment add <workspace> <row-id> <body>
+  //
+  // Thread-scoped sub-commands (comment-id addressing, parity build 2026-06-09
+  // per dock/parity-audit-2026-06-09-2):
+  //   dock comment thread <comment-id>
+  //   dock comment reply <comment-id> <body>
+  //   dock comment react <comment-id> <emoji> [add|remove]
+  //   dock comment resolve <comment-id>
+  //   dock comment unresolve <comment-id>
+  //
+  // Reply wraps the universal POST /api/workspaces/:slug/comments via
+  // a parent-derived target (two REST calls); the other four wrap
+  // their dedicated REST routes directly.
   async comment(args) {
-    await ensureAuth();
     const sub = args[0];
-    const [slug, id, ...rest] = args.slice(1);
-    if (!sub || !slug || !id) {
-      return usageError("dock comment <list|add> <workspace> <row-id> [body]");
-    }
+    if (!sub) return commentUsage();
+
+    // Validate args FIRST so usage errors don't trigger the OAuth
+    // browser flow on a fresh machine — matches the pattern in
+    // push/pull/etc. Auth only happens once we know the call is
+    // well-formed enough to actually hit the API.
     if (sub === "list" || sub === "ls") {
+      const [slug, id] = args.slice(1);
+      if (!slug || !id) return usageError("dock comment list <workspace> <row-id>");
+      await ensureAuth();
       const { comments } = await api(
         `/api/workspaces/${slug}/rows/${id}/comments`
       );
@@ -1109,8 +1129,11 @@ const commands = {
       return;
     }
     if (sub === "add") {
+      const [slug, id, ...rest] = args.slice(1);
+      if (!slug || !id) return usageError("dock comment add <workspace> <row-id> <body>");
       const body = rest.join(" ").trim();
       if (!body) return usageError("dock comment add <workspace> <row-id> <body>");
+      await ensureAuth();
       const r = await api(`/api/workspaces/${slug}/rows/${id}/comments`, {
         method: "POST",
         body: { body },
@@ -1118,7 +1141,96 @@ const commands = {
       out(`\n  ✓ Comment added\n`, r);
       return;
     }
-    return usageError("dock comment <list|add> <workspace> <row-id> [body]");
+    if (sub === "thread" || sub === "get") {
+      const [commentId] = args.slice(1);
+      if (!commentId) return usageError("dock comment thread <comment-id>");
+      await ensureAuth();
+      const data = await api(`/api/comments/${encodeURIComponent(commentId)}`);
+      if (JSON_MODE) return out(data);
+      const c = data.comment ?? data;
+      const replies = data.replies ?? [];
+      const when = new Date(c.createdAt).toISOString().slice(0, 19).replace("T", " ");
+      const resolved = c.resolvedAt ? "  [resolved]" : "";
+      out(`\n  ${when}  ${c.principalName}: ${c.body}${resolved}\n`);
+      if (c.reactions?.length) {
+        const counts = {};
+        for (const rx of c.reactions) counts[rx.emoji] = (counts[rx.emoji] || 0) + 1;
+        out("  reactions: " + Object.entries(counts).map(([e, n]) => `${e}×${n}`).join(" ") + "\n");
+      }
+      if (replies.length) {
+        out("  replies:\n");
+        for (const r of replies) {
+          const rwhen = new Date(r.createdAt).toISOString().slice(0, 19).replace("T", " ");
+          out(`    ${rwhen}  ${r.principalName}: ${r.body}\n`);
+        }
+      }
+      out("\n");
+      return;
+    }
+    if (sub === "reply") {
+      const [commentId, ...rest] = args.slice(1);
+      if (!commentId) return usageError("dock comment reply <comment-id> <body>");
+      const body = rest.join(" ").trim();
+      if (!body) return usageError("dock comment reply <comment-id> <body>");
+      await ensureAuth();
+      const parent = await api(`/api/comments/${encodeURIComponent(commentId)}`);
+      const p = parent.comment ?? parent;
+      const slug = p.workspaceSlug || p.workspace?.slug;
+      if (!slug) {
+        throw new Error(`Could not resolve workspace slug from parent comment ${commentId}`);
+      }
+      const r = await api(`/api/workspaces/${encodeURIComponent(slug)}/comments`, {
+        method: "POST",
+        body: {
+          target: { type: p.targetType, id: p.targetId },
+          body,
+          parentId: commentId,
+        },
+      });
+      out(`\n  ✓ Reply posted\n`, r);
+      return;
+    }
+    if (sub === "react") {
+      const [commentId, emoji, action = "add"] = args.slice(1);
+      if (!commentId || !emoji) {
+        return usageError("dock comment react <comment-id> <emoji> [add|remove]");
+      }
+      if (action !== "add" && action !== "remove") {
+        return usageError("dock comment react <comment-id> <emoji> [add|remove]");
+      }
+      await ensureAuth();
+      if (action === "remove") {
+        const r = await api(
+          `/api/comments/${encodeURIComponent(commentId)}/reactions/${encodeURIComponent(emoji)}`,
+          { method: "DELETE" }
+        );
+        out(`\n  ✓ Reaction removed (${emoji})\n`, r);
+        return;
+      }
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/reactions`, {
+        method: "POST",
+        body: { emoji },
+      });
+      out(`\n  ✓ Reaction added (${emoji})\n`, r);
+      return;
+    }
+    if (sub === "resolve") {
+      const [commentId] = args.slice(1);
+      if (!commentId) return usageError("dock comment resolve <comment-id>");
+      await ensureAuth();
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/resolve`, { method: "PATCH" });
+      out(`\n  ✓ Thread resolved\n`, r);
+      return;
+    }
+    if (sub === "unresolve") {
+      const [commentId] = args.slice(1);
+      if (!commentId) return usageError("dock comment unresolve <comment-id>");
+      await ensureAuth();
+      const r = await api(`/api/comments/${encodeURIComponent(commentId)}/unresolve`, { method: "PATCH" });
+      out(`\n  ✓ Thread re-opened\n`, r);
+      return;
+    }
+    return commentUsage();
   },
 
   // ─── Columns ───────────────────────────────────────────────────
@@ -2672,6 +2784,12 @@ const commands = {
     dock history <name> <row-id>           Recent change events
     dock comment list <name> <row-id>      List comments on a row
     dock comment add <name> <row-id> <body>
+    dock comment thread <comment-id>       Fetch a single thread (parent + replies + reactions)
+    dock comment reply <comment-id> <body> Reply to a comment (derives target from parent)
+    dock comment react <comment-id> <emoji> [add|remove]
+                                           Add or remove an emoji reaction
+    dock comment resolve <comment-id>      Mark a thread resolved
+    dock comment unresolve <comment-id>    Re-open a resolved thread
 
   Columns
     dock columns <name>                    List columns
@@ -2812,6 +2930,22 @@ function webUrl(slug) {
 }
 function usageError(msg) {
   console.error(`  Usage: ${msg}`);
+  process.exit(1);
+}
+
+function commentUsage() {
+  console.error(`  Usage: dock comment <subcommand>
+
+  Workspace-scoped (row addressing):
+    dock comment list <workspace> <row-id>
+    dock comment add <workspace> <row-id> <body>
+
+  Thread-scoped (comment-id addressing):
+    dock comment thread <comment-id>
+    dock comment reply <comment-id> <body>
+    dock comment react <comment-id> <emoji> [add|remove]
+    dock comment resolve <comment-id>
+    dock comment unresolve <comment-id>`);
   process.exit(1);
 }
 
