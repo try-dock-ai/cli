@@ -959,17 +959,26 @@ const commands = {
 
   async delete(args) {
     await ensureAuth();
-    const slug = args[0];
+    // parseFlags is shared and only reads `--` flags, so a bare `-y` would land
+    // in the positionals and become the workspace name. Filter it out here.
+    const assumeYes = args.includes("-y");
+    const { positional, flags } = parseFlags(args.filter((a) => a !== "-y"));
+    const slug = positional[0];
     if (!slug) return usageError("dock delete <workspace>");
-    if (!JSON_MODE) {
-      const ok = await confirm(`Delete workspace "${slug}"? This is irreversible.`);
+    // Soft archive, restorable via `dock unarchive` (see the alias below), so
+    // the prompt names the operation and the way back (support#77). The JSON
+    // payload keeps its `deleted` key so scripts reading it do not break.
+    if (!JSON_MODE && !flags.yes && !assumeYes) {
+      const ok = await confirm(
+        `Soft-archive workspace "${slug}"? Restore later with \`dock unarchive ${slug}\`.`
+      );
       if (!ok) {
         out("  Cancelled.\n", { cancelled: true });
         return;
       }
     }
     await api(`/api/workspaces/${slug}`, { method: "DELETE" });
-    out(`\n  ✓ Deleted ${slug}\n`, { deleted: slug });
+    out(`\n  ✓ Archived ${slug}\n`, { deleted: slug });
   },
 
   // `archive` is an alias for `delete` — same soft-archive semantics,
@@ -2647,7 +2656,7 @@ const commands = {
     dock visibility <name> <p|o|u|p>       private|org|unlisted|public
     dock pin <name>                        Pin to your sidebar
     dock unpin <name>                      Unpin from your sidebar
-    dock archive <name>                    Soft-archive (alias: delete)
+    dock archive <name> [-y|--yes]         Soft-archive (alias: delete)
     dock unarchive <name>                  Restore an archived workspace
     dock share <name> <email> [role]       Invite a collaborator (workspace-scoped)
     dock members <name>                    List members + pending invites
