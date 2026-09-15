@@ -2141,9 +2141,17 @@ const commands = {
     }
     await ensureAuth();
 
-    // Either accept an already-minted key (`--key dk_...`) or mint a
-    // fresh one named for this client.
+    // `--key` first, then the key the caller is already authenticated with,
+    // then mint. Minting needs a user session cookie, so an agent holding a
+    // DOCK_API_KEY could not run this command at all (support#85).
     let token = typeof flags.key === "string" ? flags.key : null;
+    if (!token) {
+      const creds = readConfig();
+      if (creds.fromEnv && typeof creds.accessToken === "string" && creds.accessToken) {
+        token = creds.accessToken;
+        if (!JSON_MODE) out(`\n  ✓ Using the key already set in DOCK_API_KEY\n`);
+      }
+    }
     if (!token) {
       const name =
         (typeof flags.name === "string" && flags.name) || `${client}-${Date.now().toString(36)}`;
@@ -2744,6 +2752,8 @@ const commands = {
                                            claude-code, claude-desktop, cursor,
                                            windsurf, zed, cline, continue.
                                            Use --key <existing> to skip the mint.
+                                           DOCK_API_KEY is reused if set, so an
+                                           agent needs no user session.
 
   Profile
     dock profile                           Show profile
