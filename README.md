@@ -145,7 +145,7 @@ $ npx @trydock/cli init reddit-tracker
   ✓ MCP endpoint live → https://trydock.ai/api/mcp?workspace=reddit-tracker
 
   Hand this workspace to any agent — they're in.
-  Web:  https://trydock.ai/workspaces/reddit-tracker
+  Web:  https://trydock.ai/acme/reddit-tracker
   MCP:  https://trydock.ai/api/mcp?workspace=reddit-tracker
 ```
 

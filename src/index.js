@@ -252,6 +252,11 @@ function b64url(buf) {
 }
 
 function openBrowser(url) {
+  // Tests and headless agents set DOCK_NO_BROWSER=1 so `dock open`
+  // (and OAuth) print the URL without launching a real browser tab.
+  if (process.env.DOCK_NO_BROWSER === "1" || process.env.DOCK_NO_BROWSER === "true") {
+    return;
+  }
   const cmd =
     process.platform === "darwin"
       ? ["open", [url]]
@@ -583,7 +588,7 @@ const commands = {
     console.log(`  ✓ MCP endpoint live → ${mcpUrl(ws.slug)}`);
     console.log();
     console.log("  Hand this workspace to any agent — they're in.");
-    console.log(`  Web:  ${webUrl(ws.slug)}`);
+    console.log(`  Web:  ${webUrl(ws.slug, workspaceOwnerSlug(ws))}`);
     console.log(`  MCP:  ${mcpUrl(ws.slug)}`);
     console.log();
   },
@@ -699,7 +704,7 @@ const commands = {
     });
     const ws = res.workspace;
     console.log(`\n  ✓ Created ${mode} workspace ${ws.slug}`);
-    console.log(`  Web:  ${webUrl(ws.slug)}`);
+    console.log(`  Web:  ${webUrl(ws.slug, workspaceOwnerSlug(ws))}`);
     console.log(`  MCP:  ${mcpUrl(ws.slug)}\n`);
   },
 
@@ -707,7 +712,11 @@ const commands = {
     await ensureAuth();
     const slug = args[0];
     if (!slug) return usageError("dock open <workspace>");
-    const url = webUrl(slug);
+    // Fetch the workspace so the URL uses its owning org, not the
+    // caller's. Shared / guest access would otherwise print
+    // /<caller-org>/<slug>, which 404s or hits a different workspace.
+    const { workspace } = await api(`/api/workspaces/${slug}`);
+    const url = webUrl(workspace?.slug || slug, workspaceOwnerSlug(workspace));
     console.log(`  Opening ${url}…\n`);
     openBrowser(url);
   },
@@ -837,7 +846,7 @@ const commands = {
     }
 
     // Make sure the workspace exists (auto-create on first push).
-    await ensureHandoffWorkspace(workspaceSlug);
+    const ws = await ensureHandoffWorkspace(workspaceSlug);
 
     // Make sure the doc surface exists (idempotent — pre-existing
     // surface short-circuits the create).
@@ -848,6 +857,7 @@ const commands = {
       { method: "PUT", body: { markdown: content } }
     );
 
+    const pageUrl = `${webUrl(workspaceSlug, workspaceOwnerSlug(ws))}?surface=${surfaceSlug}`;
     if (JSON_MODE) {
       out({
         pushed: true,
@@ -855,12 +865,12 @@ const commands = {
         surface: surfaceSlug,
         name,
         bytes: content.length,
-        url: `${webUrl(workspaceSlug)}?surface=${surfaceSlug}`,
+        url: pageUrl,
       });
       return;
     }
     console.log(
-      `\n  ✓ Pushed ${name} (${content.length} bytes) → ${workspaceSlug}/${surfaceSlug}\n  Pull from another machine:\n    dock pull ${name}${workspaceSlug !== "handoff" ? ` --workspace=${workspaceSlug}` : ""}\n  ${webUrl(workspaceSlug)}?surface=${surfaceSlug}\n`
+      `\n  ✓ Pushed ${name} (${content.length} bytes) → ${workspaceSlug}/${surfaceSlug}\n  Pull from another machine:\n    dock pull ${name}${workspaceSlug !== "handoff" ? ` --workspace=${workspaceSlug}` : ""}\n  ${pageUrl}\n`
     );
   },
 
@@ -1878,7 +1888,10 @@ const commands = {
         out(
           `\n  ✓ Created ${r.surface.kind} surface "${r.surface.name}" → ${r.surface.slug}\n`
         );
-        out(`  Open: ${webUrl(wsName)}?surface=${r.surface.slug}\n\n`);
+        const { workspace } = await api(`/api/workspaces/${wsName}`);
+        out(
+          `  Open: ${webUrl(wsName, workspaceOwnerSlug(workspace))}?surface=${r.surface.slug}\n\n`
+        );
         return;
       }
       case "rename": {
@@ -2573,7 +2586,13 @@ const commands = {
       const tag = String(hit.kind || "?").padEnd(12);
       const title = hit.title || hit.snippet || hit.id;
       out(`  ${tag} ${title}\n`);
-      if (hit.workspaceSlug) out(`               ${webUrl(hit.workspaceSlug)}\n`);
+      if (hit.workspaceSlug) {
+        const owner =
+          (typeof hit.org?.slug === "string" && hit.org.slug) ||
+          (typeof hit.orgSlug === "string" && hit.orgSlug) ||
+          null;
+        out(`               ${webUrl(hit.workspaceSlug, owner)}\n`);
+      }
     }
     out("\n");
   },
@@ -2788,6 +2807,7 @@ const commands = {
 
   Environment
     DOCK_API_URL                           API base URL (default: https://trydock.ai)
+    DOCK_NO_BROWSER=1                      Skip launching a browser (tests / headless)
 
   Docs: https://trydock.ai/docs
 `);
@@ -2806,8 +2826,30 @@ function mcpUrl(slug) {
   const base = API_BASE.replace(/\/$/, "");
   return `${base}/api/mcp?workspace=${slug}`;
 }
-function webUrl(slug) {
+
+/**
+ * Org that owns a workspace. OpenAPI marks `org.slug` required on every
+ * Workspace object. Do NOT use `/api/me`'s org here: a shared workspace
+ * can belong to a different org than the caller (support#75 / issue #6).
+ */
+function workspaceOwnerSlug(ws) {
+  const slug = ws?.org?.slug;
+  return typeof slug === "string" && slug ? slug : null;
+}
+
+/**
+ * Human-facing workspace URL. Docs and the product UI use
+ * `/<owner>/<slug>` (slugs are unique per org). The CLI used to emit
+ * `/workspaces/<slug>`, which resolves but is the form nobody shares
+ * (support#75 / issue #6). `ownerSlug` must be the workspace's owning
+ * org, never the caller's. Fall back to the flat form when the owner
+ * is unknown so shared-workspace links keep working.
+ */
+function webUrl(slug, ownerSlug) {
   const base = API_BASE.replace(/\/$/, "");
+  if (typeof ownerSlug === "string" && ownerSlug) {
+    return `${base}/${ownerSlug}/${slug}`;
+  }
   return `${base}/workspaces/${slug}`;
 }
 function usageError(msg) {
@@ -2851,8 +2893,8 @@ function slugifyForSurface(name) {
  */
 async function ensureHandoffWorkspace(slug) {
   try {
-    await api(`/api/workspaces/${slug}`);
-    return;
+    const r = await api(`/api/workspaces/${slug}`);
+    return r.workspace;
   } catch (e) {
     if (e.status !== 404) throw e;
   }
@@ -2862,10 +2904,11 @@ async function ensureHandoffWorkspace(slug) {
     .split("-")
     .map((w, i) => (i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w))
     .join(" ");
-  await api(`/api/workspaces`, {
+  const r = await api(`/api/workspaces`, {
     method: "POST",
     body: { name, mode: "doc" },
   });
+  return r.workspace;
 }
 
 /**
