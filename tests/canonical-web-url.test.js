@@ -217,3 +217,22 @@ test("dock open falls back to /workspaces/<slug> when org is missing", async () 
     await new Promise((r) => server.close(() => r()));
   }
 });
+
+test("dock open falls back when the workspace lookup fails", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "unavailable" }));
+  });
+  const api = await new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ base: `http://127.0.0.1:${server.address().port}` });
+    });
+  });
+  try {
+    const r = await run(["open", "shared-ws"], { apiBase: api.base });
+    assert.equal(r.status, 0, r.stderr || r.stdout);
+    assert.match(r.stdout, /Opening http:\/\/127\.0\.0\.1:\d+\/workspaces\/shared-ws/);
+  } finally {
+    await new Promise((r) => server.close(() => r()));
+  }
+});

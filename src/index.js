@@ -712,10 +712,13 @@ const commands = {
     await ensureAuth();
     const slug = args[0];
     if (!slug) return usageError("dock open <workspace>");
-    // Fetch the workspace so the URL uses its owning org, not the
-    // caller's. Shared / guest access would otherwise print
-    // /<caller-org>/<slug>, which 404s or hits a different workspace.
-    const { workspace } = await api(`/api/workspaces/${slug}`);
+    // Prefer the workspace's owning org for the URL. A failed lookup
+    // must not fail the command: fall back to /workspaces/<slug> so
+    // a transient 403/network error still opens something usable.
+    const workspace = await api(`/api/workspaces/${slug}`).then(
+      (r) => r.workspace,
+      () => null,
+    );
     const url = webUrl(workspace?.slug || slug, workspaceOwnerSlug(workspace));
     console.log(`  Opening ${url}…\n`);
     openBrowser(url);
@@ -1888,7 +1891,13 @@ const commands = {
         out(
           `\n  ✓ Created ${r.surface.kind} surface "${r.surface.name}" → ${r.surface.slug}\n`
         );
-        const { workspace } = await api(`/api/workspaces/${wsName}`);
+        // Lookup is only for the Open URL. A failure here must not
+        // flip the command to exit 1 after the surface already exists
+        // (an agent that retries on non-zero would create a duplicate).
+        const workspace = await api(`/api/workspaces/${wsName}`).then(
+          (r) => r.workspace,
+          () => null,
+        );
         out(
           `  Open: ${webUrl(wsName, workspaceOwnerSlug(workspace))}?surface=${r.surface.slug}\n\n`
         );
@@ -2587,11 +2596,9 @@ const commands = {
       const title = hit.title || hit.snippet || hit.id;
       out(`  ${tag} ${title}\n`);
       if (hit.workspaceSlug) {
-        const owner =
-          (typeof hit.org?.slug === "string" && hit.org.slug) ||
-          (typeof hit.orgSlug === "string" && hit.orgSlug) ||
-          null;
-        out(`               ${webUrl(hit.workspaceSlug, owner)}\n`);
+        out(
+          `               ${webUrl(hit.workspaceSlug, workspaceOwnerSlug(hit.workspace))}\n`,
+        );
       }
     }
     out("\n");
@@ -2831,6 +2838,7 @@ function mcpUrl(slug) {
  * Org that owns a workspace. OpenAPI marks `org.slug` required on every
  * Workspace object. Do NOT use `/api/me`'s org here: a shared workspace
  * can belong to a different org than the caller (support#75 / issue #6).
+ * Search hits nest the same shape under `hit.workspace`.
  */
 function workspaceOwnerSlug(ws) {
   const slug = ws?.org?.slug;
@@ -2843,7 +2851,7 @@ function workspaceOwnerSlug(ws) {
  * `/workspaces/<slug>`, which resolves but is the form nobody shares
  * (support#75 / issue #6). `ownerSlug` must be the workspace's owning
  * org, never the caller's. Fall back to the flat form when the owner
- * is unknown so shared-workspace links keep working.
+ * is unknown or a lookup failed, so shared-workspace links keep working.
  */
 function webUrl(slug, ownerSlug) {
   const base = API_BASE.replace(/\/$/, "");
