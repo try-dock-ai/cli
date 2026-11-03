@@ -1,0 +1,3 @@
+# Code owners: Govind only (CI audit lockdown, 11-02; Govind via Meera).
+# Every path needs Govind's review once branch protection requires code-owner reviews on main.
+* @govindkavaturi-art
